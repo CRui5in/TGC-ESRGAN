@@ -5,8 +5,9 @@ scale: 4
 num_gpu: auto  # 自动检测GPU数量，设置为1则只使用单GPU
 manual_seed: 42
 use_amp: true  # 使用混合精度训练以节省显存
-use_ddp: false  # 是否使用DistributedDataParallel，false则使用DataParallel
-gpu_ids: [0]  # 显式指定GPU IDs
+use_ddp: true
+find_unused_parameters: true  # 添加此参数以解决分布式训练中未使用参数的问题
+gpu_ids: [0, 1, 2]
 multiprocessing_start_method: spawn  # 添加多进程启动方法设置
 
 # 数据集配置
@@ -23,7 +24,8 @@ datasets:
     phase: train
     use_original_size: true  # 使用原始图像尺寸，不进行随机裁剪
     use_hflip: true  # 水平翻转增强
-    use_rot: true  # 旋转增强
+    use_rot: false  # 旋转增强
+    use_shuffle: true  # 添加数据打乱设置
     
     # RealESRGAN退化配置 - 与Real-ESRGAN保持一致
     blur_kernel_size: 21  # 恢复到21
@@ -89,7 +91,7 @@ datasets:
     use_original_size: true
     use_hflip: false
     use_rot: false
-    num_worker_per_gpu: 1  # worker数量
+    num_worker_per_gpu: 2  # worker数量
     batch_size_per_gpu: 1  # batch size
 
   test:
@@ -103,7 +105,7 @@ datasets:
     use_original_size: true
     use_hflip: false
     use_rot: false
-    num_worker_per_gpu: 1  # worker数量
+    num_worker_per_gpu: 2  # worker数量
     batch_size_per_gpu: 1  # batch size
 
 # 网络配置
@@ -127,7 +129,7 @@ network_d:
 
 # 文本编码器配置
 text_encoder:
-  name: /root/autodl-tmp/clip-vit-base-patch16
+  name: /root/autodl-tmp/clip-vit-base-patch32
   text_dim: 512
   freeze: true
   save_with_model: false
@@ -212,7 +214,7 @@ train:
 
 # 验证配置
 val:
-  val_freq: 1000
+  val_freq: 10000
   save_img: true
   save_visualization: false
   use_original_size: true
@@ -230,7 +232,7 @@ val:
 # 测试配置
 test:
   test_freq: 50000
-  max_test_samples: 1000
+  max_test_samples: 500
   metrics:
     psnr:
       type: calculate_psnr
@@ -244,7 +246,7 @@ test:
 # 日志配置
 logger:
   print_freq: 100
-  save_checkpoint_freq: 10000
+  save_checkpoint_freq: 50000
   use_tb_logger: true
   save_training_image_freq: 1000
   tb_log_freq: 20
@@ -253,4 +255,8 @@ logger:
 # 分布式训练配置
 dist_params:
   backend: nccl
-  port: 29500 
+  port: 29500
+  local_rank: 0
+  launcher: pytorch
+  rank: 0
+  world_size: 1  # 会在运行时自动更新 

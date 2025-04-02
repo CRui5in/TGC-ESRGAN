@@ -32,122 +32,6 @@ import cv2
 # 使用我们的改进版tensor2img替换原版
 from tgsr.utils.visualization_utils import improved_tensor2img as tensor2img
 
-class EnhancedMessageLogger(MessageLogger):
-    """增强版消息日志器，改进TensorBoard的分组和可视化"""
-    
-    def __init__(self, opt, start_iter=0, tb_logger=None):
-        super().__init__(opt, start_iter, tb_logger)
-        # 添加一个变量来存储当前迭代数，用于解决lint错误
-        self.current_iter = start_iter
-        
-        # 如果是恢复训练，确保TensorBoard从正确的迭代次数开始记录
-        if tb_logger is not None and hasattr(tb_logger, '_get_file_writer'):
-            writer = tb_logger._get_file_writer()
-            if writer is not None and hasattr(writer, 'add_summary'):
-                # 添加一个标记，表示这是恢复的训练
-                tb_logger.add_text('resume_info', f'从迭代次数 {start_iter} 恢复训练', start_iter)
-            
-    def __call__(self, log_vars):
-        """
-        覆盖原方法，改进TensorBoard记录，确保train/val正确分组
-        Args:
-            log_vars (dict): 包含所有日志变量的字典。
-        """
-        # 文本日志
-        # 使用同样的文本日志格式
-        message = f'[{log_vars.pop("epoch"):.4f}][{log_vars.pop("iter"):8d}]'
-        
-        # 添加学习率
-        if 'lrs' in log_vars:
-            lrs = log_vars.pop('lrs')
-            message += f'[{", ".join([f"{lr:.3e}" for lr in lrs])}]'
-            
-            # 记录学习率到TensorBoard
-            if self.tb_logger is not None:
-                for i, lr in enumerate(lrs):
-                    self.tb_logger.add_scalar(f'train/lr/lr_{i}', lr, self.current_iter)
-            
-        # 添加其他训练日志
-        for k, v in log_vars.items():
-            # 只显示不带train/val前缀的日志名称
-            display_key = k.split('/')[-1] if '/' in k else k
-            message += f'{display_key}: {v:.4e} '
-            
-        # 打印日志
-        self.logger.info(message)
-        
-        # TensorBoard日志
-        if self.tb_logger is not None:
-            # 确保对每个损失都记录其值，并始终将其添加到TensorBoard
-            loss_keys_to_ensure = [
-                'l_pix', 'l_percep', 'l_style', 'l_g_gan', 'l_total',
-                'l_d_real', 'l_d_fake'
-            ]
-            
-            # 整理日志，按照前缀分组
-            train_losses = {}
-            val_metrics = {}
-            train_metrics = {}
-            other_metrics = {}
-            
-            for k, v in log_vars.items():
-                if k.startswith('train/'):
-                    # 已有train/前缀的，每个迭代都记录
-                    self.tb_logger.add_scalar(k, v, self.current_iter)
-                    
-                    # 提取类别，例如train/losses/l_pix -> losses
-                    parts = k.split('/')
-                    if len(parts) >= 2:
-                        category = parts[1]
-                        name = parts[-1] if len(parts) >= 3 else parts[-1]
-                        
-                        # 按类别分组
-                        if category not in train_losses:
-                            train_losses[category] = {}
-                        train_losses[category][name] = v
-                        
-                elif k.startswith('val/'):
-                    # 已有val/前缀的，每个迭代都记录 
-                    self.tb_logger.add_scalar(k, v, self.current_iter)
-                    
-                    # 提取类别
-                    parts = k.split('/')
-                    if len(parts) >= 2:
-                        category = parts[1]
-                        name = parts[-1] if len(parts) >= 3 else parts[-1]
-                        
-                        # 按类别分组
-                        if category not in val_metrics:
-                            val_metrics[category] = {}
-                        val_metrics[category][name] = v
-                
-                elif 'psnr' in k.lower() or 'ssim' in k.lower():
-                    # 验证指标
-                    key = f'val/metrics/{k}'
-                    self.tb_logger.add_scalar(key, v, self.current_iter)
-                    val_metrics.setdefault('metrics', {})[k] = v
-                
-                elif any(loss_key in k for loss_key in loss_keys_to_ensure) or 'loss' in k.lower():
-                    # 处理所有损失类型 - 确保每个迭代都记录
-                    key = f'train/losses/{k}'
-                    self.tb_logger.add_scalar(key, v, self.current_iter)
-                    train_losses.setdefault('losses', {})[k] = v
-                
-                else:
-                    # 其他指标
-                    key = f'other/{k}'
-                    self.tb_logger.add_scalar(key, v, self.current_iter)
-                    other_metrics[k] = v
-            
-            # 添加总损失到training/losses组
-            if 'losses' in train_losses and len(train_losses['losses']) > 0:
-                total_loss = sum(train_losses['losses'].values())
-                self.tb_logger.add_scalar('train/losses/total', total_loss, self.current_iter)
-        
-        # 更新当前迭代次数
-        self.current_iter += 1
-
-
 def parse_options():
     """命令行参数解析"""
     parser = argparse.ArgumentParser()
@@ -155,10 +39,18 @@ def parse_options():
     parser.add_argument('--launcher', type=str, default='none', help='启动器 {none, pytorch, slurm}')
     parser.add_argument('--auto_resume', action='store_true')
     parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--local_rank', '--local-rank', type=int, default=0, help='分布式训练的本地排名')
     parser.add_argument('--memory_opt', action='store_true', help='启用内存优化')
     parser.add_argument('--reuse_exp_dir', action='store_true', help='继续使用已存在的实验目录')
     args = parser.parse_args()
+    
+    # 从环境变量中获取分布式训练参数（用于torchrun）
+    if 'LOCAL_RANK' in os.environ:
+        args.local_rank = int(os.environ['LOCAL_RANK'])
+    if 'RANK' in os.environ:
+        args.rank = int(os.environ['RANK'])
+    if 'WORLD_SIZE' in os.environ:
+        args.world_size = int(os.environ['WORLD_SIZE'])
     
     # 手动解析YAML配置文件
     import yaml
@@ -179,14 +71,40 @@ def parse_options():
         if args.launcher == 'slurm' and 'dist_params' in opt:
             init_dist(args.launcher, **opt['dist_params'])
         else:
+            # 更新分布式参数
+            if 'dist_params' in opt:
+                opt['dist_params']['rank'] = args.local_rank
+                opt['dist_params']['local_rank'] = args.local_rank
+                opt['dist_params']['launcher'] = args.launcher
+            else:
+                opt['dist_params'] = {
+                    'backend': 'nccl', 
+                    'rank': args.local_rank,
+                    'local_rank': args.local_rank,
+                    'launcher': args.launcher,
+                    'port': 29500
+                }
+            
+            # 初始化分布式
             init_dist(args.launcher)
-            print('初始化PyTorch分布式训练环境...')
+            print(f'初始化PyTorch分布式训练环境... rank: {args.local_rank}')
     
     # 内存优化
     if args.memory_opt:
         opt['train']['memory_efficient'] = True
     
+    # 获取分布式信息
     opt['rank'], opt['world_size'] = get_dist_info()
+    
+    # 根据实际分布式情况更新参数
+    if opt['dist']:
+        # 根据rank和world_size自动调整GPU IDs
+        if 'gpu_ids' in opt:
+            if opt['world_size'] > 1:
+                opt['gpu_ids'] = list(range(opt['world_size']))
+            else:
+                opt['gpu_ids'] = [opt['rank']]  # 单GPU情况下使用指定的rank
+        print(f'GPU IDs: {opt["gpu_ids"]}')
     
     # 随机种子
     seed = opt.get('manual_seed')
@@ -247,7 +165,9 @@ def init_loggers(opt, args=None):
     
     # 初始化tensorboard日志器
     tb_logger = None
-    if opt['logger'].get('use_tb_logger') and 'debug' not in opt['name']:
+    
+    # 只有在rank=0的主进程中初始化TensorBoard
+    if opt['rank'] == 0 and opt['logger'].get('use_tb_logger') and 'debug' not in opt['name']:
         tb_dir = osp.join('tb_logger', opt['name'])
         os.makedirs(tb_dir, exist_ok=True)
         log_dir = tb_dir
@@ -281,44 +201,45 @@ def init_loggers(opt, args=None):
         tb_logger = init_tb_logger(log_dir=log_dir)
         
         # 添加配置信息
-        tb_logger.add_text('config', dict2str(opt).replace('\n', '  \n'), 0)
+        tb_logger.add_text('Config', dict2str(opt).replace('\n', '  \n'), 0)
         
         # 添加环境信息
         env_info = get_env_info()
-        tb_logger.add_text('env_info', str(env_info).replace('\n', '  \n'), 0)
+        tb_logger.add_text('Environment', str(env_info).replace('\n', '  \n'), 0)
         
         # 记录主要超参数
         if 'network_g' in opt:
             if 'type' in opt['network_g']:
-                tb_logger.add_text('network_g', opt['network_g']['type'], 0)
+                tb_logger.add_text('Model', opt['network_g']['type'], 0)
             
             # 定义TensorBoard布局
             layout = {
                 "训练与验证": {
                     "损失函数": {
-                        "训练损失": ["Multiline", ["Train/losses/l_pix", "Train/losses/l_percep", 
-                                          "Train/losses/l_style", "Train/losses/l_g_gan", 
-                                          "Train/losses/l_total"]],
-                        "判别器损失": ["Multiline", ["Train/losses/l_d_real", "Train/losses/l_d_fake"]]
+                        "训练损失": ["Multiline", ["Train/Losses/l_pix", "Train/Losses/l_percep", 
+                                          "Train/Losses/l_style", "Train/Losses/l_g_gan", 
+                                          "Train/Losses/l_total"]],
+                        "判别器损失": ["Multiline", ["Train/Losses/l_d_real", "Train/Losses/l_d_fake"]]
                     },
-                    "训练学习率": {
-                        "学习率": ["Multiline", ["Train/learningrate/lr_0", "Train/learningrate/lr_1"]]
+                    "学习率": {
+                        "学习率": ["Multiline", ["Train/learning_rate"]]
                     },
                     "验证指标": {
-                        "指标": ["Multiline", ["Val/metrics/psnr", "Val/metrics/ssim"]]
+                        "指标": ["Multiline", ["Validation/Metrics/psnr", "Validation/Metrics/ssim"]]
+                    },
+                    "测试指标": {
+                        "指标": ["Multiline", ["Test/Metrics/psnr", "Test/Metrics/ssim"]]
                     }
                 },
                 "可视化结果": {
                     "训练图像": {
-                        "比较图": ["Images", ["Train/images/comparison"]],
-                        "单独图像": ["Images", ["Train/images/LQ", "Train/images/SR", "Train/images/GT"]]
+                        "单独图像": ["Images", ["Train/Images/LQ", "Train/Images/SR", "Train/Images/GT"]]
                     },
                     "验证图像": {
-                        "验证图像": ["Images", ["Val/images/*"]]
+                        "单独图像": ["Images", ["Validation/Images/LQ", "Validation/Images/SR", "Validation/Images/GT"]]
                     },
-                    "注意力热力图": {
-                        "注意力图": ["Images", ["Train/attention/*"]],
-                        "热力图": ["Images", ["Train/heatmap/*"]]
+                    "测试图像": {
+                        "单独图像": ["Images", ["Test/Images/LQ", "Test/Images/SR", "Test/Images/GT"]]
                     }
                 }
             }
@@ -344,8 +265,8 @@ def init_loggers(opt, args=None):
             
             logger.info(f'TensorBoard初始化完成: {log_dir}')
     
-    # 初始化wandb日志器
-    if (opt['logger'].get('wandb') is not None) and (opt['logger']['wandb'].get('project')
+    # 初始化wandb日志器 - 同样只在rank=0的主进程中初始化
+    if opt['rank'] == 0 and (opt['logger'].get('wandb') is not None) and (opt['logger']['wandb'].get('project')
                                                     is not None) and 'debug' not in opt['name']:
         init_wandb_logger(opt)
     
@@ -405,6 +326,10 @@ def main():
     # 解析参数
     opt, args = parse_options()
     
+    # 显示分布式训练信息
+    rank, world_size = get_dist_info()
+    print(f"分布式训练信息 - Rank: {rank}, World Size: {world_size}, GPU: {torch.cuda.current_device()}")
+    
     # 创建实验目录
     if args.reuse_exp_dir and os.path.exists(opt['path']['experiments_root']):
         logger_exp = get_root_logger()
@@ -414,17 +339,36 @@ def main():
         os.makedirs(os.path.join(opt['path']['experiments_root'], 'training_states'), exist_ok=True)
         os.makedirs(os.path.join(opt['path']['experiments_root'], 'visualization'), exist_ok=True)
     else:
-        make_exp_dirs(opt)
+        # 只在主进程中创建目录
+        if opt['rank'] == 0:
+            make_exp_dirs(opt)
+        
+    # 对于分布式训练，确保所有进程都等待主进程创建目录
+    if opt.get('dist', False):
+        torch.distributed.barrier()
         
     if opt['logger'].get('use_tb_logger') and 'debug' not in opt['name']:
         if args.reuse_exp_dir and os.path.exists(os.path.join('tb_logger', opt['name'])):
             logger_tb = get_root_logger()
             logger_tb.info(f"继续使用已存在的TensorBoard日志目录: {os.path.join('tb_logger', opt['name'])}")
         else:
-            mkdir_and_rename(osp.join('tb_logger', opt['name']))
+            # 只在主进程中创建TensorBoard目录
+            if opt['rank'] == 0:
+                mkdir_and_rename(osp.join('tb_logger', opt['name']))
     
     # 初始化日志器 - 传递args参数
     logger, tb_logger = init_loggers(opt, args)
+    
+    # 记录重要的训练参数
+    logger.info(f'分布式训练: {opt.get("dist", False)}, 使用进程: {opt["rank"]}/{opt["world_size"]}')
+    if opt.get("dist", False):
+        logger.info(f'分布式后端: {opt.get("dist_params", {}).get("backend", "未设置")}')
+    logger.info(f'GPU IDs: {opt.get("gpu_ids", [])}')
+    logger.info(f'使用DDP: {opt.get("use_ddp", False)}')
+    logger.info(f'混合精度训练: {opt["train"].get("fp16", False)}')
+    logger.info(f'TensorBoard记录器状态: {"已启用" if tb_logger else "未启用"}')
+    logger.info(f'EMA: {opt["train"].get("use_ema", False)}')
+    logger.info(f'文本编码器: {opt.get("text_encoder", {}).get("name", "未设置")}')
     
     # 创建数据加载器
     train_loader, train_sampler, val_loader, total_epochs, total_iters = create_train_val_dataloader(opt, logger)
@@ -436,15 +380,17 @@ def main():
     
     # 恢复训练
     if opt['path'].get('resume_state'):
-        resume_state = torch.load(opt['path']['resume_state'], map_location=lambda storage, loc: storage.cuda(opt['gpu_ids'][0]))
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        resume_state = torch.load(
+            opt['path']['resume_state'],
+            map_location=lambda storage, loc: storage.cuda(device)
+        )
         check_resume(opt, resume_state['iter'])
         model.resume_training(resume_state)  # 恢复训练状态
         current_iter = resume_state['iter']
         start_epoch = resume_state['epoch']
         logger.info(f"从迭代轮次 {current_iter} 恢复训练")
     
-    # 创建消息日志器（使用增强版）
-    msg_logger = EnhancedMessageLogger(opt, current_iter, tb_logger)
     
     # 创建预取数据加载器
     prefetcher = None
@@ -470,16 +416,23 @@ def main():
     # 训练循环
     logger.info(f'开始训练，总迭代次数: {total_iters}, 总轮次: {total_epochs}')
     for epoch in range(start_epoch, total_epochs + 1):
+        # 设置epoch用于数据采样
         train_sampler.set_epoch(epoch)
+        
+        # 重置预取器
         prefetcher.reset()
         train_data = prefetcher.next()
         
         # 添加tqdm进度条，创建带进度条的迭代器
         # 计算当前epoch预期的迭代次数，用于设置进度条总长度
         expected_iter = min(iter_per_epoch, total_iters - current_iter)
-        pbar = tqdm(total=expected_iter, desc=f'Epoch {epoch}/{total_epochs}', 
-                   dynamic_ncols=True, unit='iter')
         
+        # 只在主进程中显示进度条
+        if opt['rank'] == 0:
+            pbar = tqdm(total=expected_iter, desc=f'Epoch {epoch}/{total_epochs}', 
+                      dynamic_ncols=True, unit='iter')
+        
+        # 训练循环
         while train_data is not None:
             current_iter += 1
             if current_iter > total_iters:
@@ -498,120 +451,44 @@ def main():
             # 计算时间
             iter_time = time.time() - iter_start_time
             
-            # # 训练日志
-            # if current_iter % opt['logger']['print_freq'] == 0:
-            #     log_vars = {'epoch': epoch, 'iter': current_iter}
-            #     log_vars.update({'lrs': model.get_current_learning_rate()})
-            #     log_vars.update({'time': iter_time})
-            #     log_vars.update(model.get_current_log())
-            #     message = logger.train_message(log_vars)
-            #     logger.info(message)
+            # 记录损失到TensorBoard - 仅在主进程中
+            if opt['rank'] == 0:
+                tb_log_freq = opt['logger'].get('tb_log_freq', opt['logger']['print_freq'])
+                if tb_logger is not None and current_iter % tb_log_freq == 0:
+                    model.log_current(current_iter, tb_logger)
             
-            # 记录损失到TensorBoard
-            tb_log_freq = opt['logger'].get('tb_log_freq', opt['logger']['print_freq'])
-            if tb_logger and current_iter % tb_log_freq == 0:
-                log_vars = {'epoch': epoch, 'iter': current_iter}
-                log_vars.update({'lrs': model.get_current_learning_rate()})
-                log_vars.update(model.get_current_log())
-                tb_logger_kwargs = dict(global_step=current_iter)
-                tb_logger.add_scalar('epoch', epoch, **tb_logger_kwargs)
-                # 记录当前日志到TensorBoard，使用模型内部的log_current方法
-                model.log_current(current_iter, tb_logger)
-                
-            # 每隔一定迭代次数记录当前训练图像
-            if tb_logger and current_iter % opt['logger'].get('save_training_image_freq', 1000) == 0:
-                try:
-                    # 获取当前训练批次的图像
-                    lq = model.lq[:1]  # 只取第一张图片
-                    gt = model.gt[:1]
-                    sr = model.output[:1]
-                    
-                    # 转换为numpy图像以便添加到TensorBoard
-                    lq_img = tensor2img(lq, rgb2bgr=False, min_max=(0, 1))
-                    sr_img = tensor2img(sr, rgb2bgr=False, min_max=(0, 1))
-                    gt_img = tensor2img(gt, rgb2bgr=False, min_max=(0, 1))
-                    
-                    # 将LQ图像放大到与SR图像相同的尺寸
-                    if lq_img.shape[0] != sr_img.shape[0] or lq_img.shape[1] != sr_img.shape[1]:
-                        lq_img = cv2.resize(lq_img, (sr_img.shape[1], sr_img.shape[0]), interpolation=cv2.INTER_LANCZOS4)
-                    
-                    # 确保GT图像与SR尺寸相同
-                    if gt_img.shape[0] != sr_img.shape[0] or gt_img.shape[1] != sr_img.shape[1]:
-                        gt_img = cv2.resize(gt_img, (sr_img.shape[1], sr_img.shape[0]), interpolation=cv2.INTER_LANCZOS4)
-                    
-                    # 添加文本标记以便区分图像
-                    if hasattr(model, '_add_text_marker'):
-                        lq_img = model._add_text_marker(lq_img, 'LQ')
-                        sr_img = model._add_text_marker(sr_img, 'SR')
-                        gt_img = model._add_text_marker(gt_img, 'GT')
-                    
-                    # 横向拼接三个图像并添加水平空白间隔
-                    h, w = sr_img.shape[:2]
-                    spacer = np.ones((h, 10, 3), dtype=np.uint8) * 255  # 白色水平空白间隔
-                    comparison = np.concatenate(
-                        [lq_img, spacer, sr_img, spacer, gt_img], 
-                        axis=1  # 使用axis=1进行水平拼接
-                    )
-                    
-                    # 添加到TensorBoard
-                    tb_logger.add_image('train/images/comparison', comparison, current_iter, dataformats='HWC')
-                    
-                    # 也添加单独的图像
-                    tb_logger.add_image('train/images/LQ', lq_img, current_iter, dataformats='HWC')
-                    tb_logger.add_image('train/images/SR', sr_img, current_iter, dataformats='HWC')
-                    tb_logger.add_image('train/images/GT', gt_img, current_iter, dataformats='HWC')
-                    
-                    # 生成简单的热力图 - 直接使用差异图
-                    diff_map = np.abs(sr_img.astype(np.float32) - gt_img.astype(np.float32))
-                    diff_map = diff_map.mean(axis=2)  # 转为单通道
-                    diff_map = diff_map / diff_map.max() * 255  # 归一化到0-255
-                    
-                    # 应用热力图颜色映射
-                    heatmap = cv2.applyColorMap(diff_map.astype(np.uint8), cv2.COLORMAP_JET)
-                    
-                    # 将热力图与SR图像混合
-                    overlay = cv2.addWeighted(sr_img, 0.7, heatmap, 0.3, 0)
-                    
-                    # 添加到TensorBoard
-                    tb_logger.add_image('train/attention/diff_map', overlay, current_iter, dataformats='HWC')
-                    tb_logger.add_image('train/heatmap/diff_map', heatmap, current_iter, dataformats='HWC')
-                    
-                    # 记录日志
-                    logger.info(f'已添加训练图像和热力图到TensorBoard，当前迭代: {current_iter}')
-                except Exception as e:
-                    logger.error(f"记录训练图像到TensorBoard时出错: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                
-                # 更新迭代计数
-                current_iter += 1
+            # 更新进度条 - 仅在主进程中
+            if opt['rank'] == 0:
+                pbar.update(1)
             
-            # 保存模型
-            if current_iter % opt['logger']['save_checkpoint_freq'] == 0:
+            # 保存模型 - 仅在主进程中
+            if opt['rank'] == 0 and current_iter % opt['logger']['save_checkpoint_freq'] == 0:
                 logger.info('保存模型...')
                 model.save(epoch, current_iter)
             
-            # 验证
-            if opt['val']['val_freq'] > 0 and current_iter % opt['val']['val_freq'] == 0:
+            # 验证 - 仅在特定迭代次数执行，并且current_iter > 0
+            if opt['rank'] == 0 and opt['val']['val_freq'] > 0 and current_iter % opt['val']['val_freq'] == 0 and current_iter > 0:
                 # 减少内存使用
                 if memory_efficient:
                     torch.cuda.empty_cache()
                     
                 # 验证前先更新进度条描述
-                pbar.set_description(f'Epoch {epoch}/{total_epochs} (Validating...)')
+                if opt['rank'] == 0:
+                    pbar.set_description(f'Epoch {epoch}/{total_epochs} (Validating...)')
                 
                 # 确保保存图像用于可视化
                 model.validation(val_loader, current_iter, tb_logger, save_img=True)
                 
                 # 验证后恢复进度条描述
-                pbar.set_description(f'Epoch {epoch}/{total_epochs}')
+                if opt['rank'] == 0:
+                    pbar.set_description(f'Epoch {epoch}/{total_epochs}')
                 
                 # 减少内存使用
                 if memory_efficient:
                     torch.cuda.empty_cache()
             
-            # 测试
-            if 'test' in opt and 'test_freq' in opt['test'] and opt['test']['test_freq'] > 0 and current_iter % opt['test']['test_freq'] == 0:
+            # 测试 - 仅在特定迭代次数执行，并且current_iter > 0
+            if opt['rank'] == 0 and 'test' in opt and 'test_freq' in opt['test'] and opt['test']['test_freq'] > 0 and current_iter % opt['test']['test_freq'] == 0 and current_iter > 0:
                 # 减少内存使用
                 if memory_efficient:
                     torch.cuda.empty_cache()
@@ -627,74 +504,17 @@ def main():
                     seed=opt['manual_seed'])
                 
                 logger.info(f"开始在完整测试集上进行测试，当前迭代: {current_iter}")
-                pbar.set_description(f'Epoch {epoch}/{total_epochs} (Testing...)')
+                
+                if opt['rank'] == 0:
+                    pbar.set_description(f'Epoch {epoch}/{total_epochs} (Testing...)')
                 
                 # 执行测试
                 model.validation(test_loader, current_iter, tb_logger, save_img=False, is_test=True)
                 
-                # 添加测试结果到TensorBoard
-                if tb_logger:
+                # 添加测试结果到TensorBoard - 仅在主进程中
+                if opt['rank'] == 0 and tb_logger is not None:
                     try:
-                        # 获取当前测试批次的图像
-                        lq = model.lq[:1]  # 只取第一张图片
-                        gt = model.gt[:1]
-                        sr = model.output[:1]
-                        
-                        # 转换为numpy图像
-                        lq_img = tensor2img(lq, rgb2bgr=False, min_max=(0, 1))
-                        sr_img = tensor2img(sr, rgb2bgr=False, min_max=(0, 1))
-                        gt_img = tensor2img(gt, rgb2bgr=False, min_max=(0, 1))
-                        
-                        # 将LQ图像放大到与SR图像相同的尺寸
-                        if lq_img.shape[0] != sr_img.shape[0] or lq_img.shape[1] != sr_img.shape[1]:
-                            lq_img = cv2.resize(lq_img, (sr_img.shape[1], sr_img.shape[0]), interpolation=cv2.INTER_LANCZOS4)
-                        
-                        # 确保GT图像与SR尺寸相同
-                        if gt_img.shape[0] != sr_img.shape[0] or gt_img.shape[1] != sr_img.shape[1]:
-                            gt_img = cv2.resize(gt_img, (sr_img.shape[1], sr_img.shape[0]), interpolation=cv2.INTER_LANCZOS4)
-                        
-                        # 添加文本标记
-                        if hasattr(model, '_add_text_marker'):
-                            lq_img = model._add_text_marker(lq_img, 'LQ')
-                            sr_img = model._add_text_marker(sr_img, 'SR')
-                            gt_img = model._add_text_marker(gt_img, 'GT')
-                        
-                        # 横向拼接三个图像并添加水平空白间隔
-                        h, w = sr_img.shape[:2]
-                        spacer = np.ones((h, 10, 3), dtype=np.uint8) * 255  # 白色水平空白间隔
-                        comparison = np.concatenate(
-                            [lq_img, spacer, sr_img, spacer, gt_img], 
-                            axis=1  # 使用axis=1进行水平拼接
-                        )
-                        
-                        # 添加到TensorBoard
-                        tb_logger.add_image('test/images/comparison', comparison, current_iter, dataformats='HWC')
-                        tb_logger.add_image('test/images/LQ', lq_img, current_iter, dataformats='HWC')
-                        tb_logger.add_image('test/images/SR', sr_img, current_iter, dataformats='HWC')
-                        tb_logger.add_image('test/images/GT', gt_img, current_iter, dataformats='HWC')
-                        
-                        # 生成差异热力图
-                        diff_map = np.abs(sr_img.astype(np.float32) - gt_img.astype(np.float32))
-                        diff_map = diff_map.mean(axis=2)  # 转为单通道
-                        diff_map = diff_map / diff_map.max() * 255  # 归一化到0-255
-                        
-                        # 应用热力图颜色映射
-                        heatmap = cv2.applyColorMap(diff_map.astype(np.uint8), cv2.COLORMAP_JET)
-                        
-                        # 将热力图与SR图像混合
-                        overlay = cv2.addWeighted(sr_img, 0.7, heatmap, 0.3, 0)
-                        
-                        # 添加到TensorBoard
-                        tb_logger.add_image('test/attention/diff_map', overlay, current_iter, dataformats='HWC')
-                        tb_logger.add_image('test/heatmap/diff_map', heatmap, current_iter, dataformats='HWC')
-                        
-                        # 记录测试指标
-                        if hasattr(model, 'get_current_log'):
-                            test_log = model.get_current_log()
-                            for k, v in test_log.items():
-                                if 'psnr' in k.lower() or 'ssim' in k.lower():
-                                    tb_logger.add_scalar(f'test/metrics/{k}', v, current_iter)
-                        
+                        # 不再重复添加测试图像和指标，由model.test()和model.validation()函数处理
                         logger.info(f'已添加测试图像和指标到TensorBoard，当前迭代: {current_iter}')
                     except Exception as e:
                         logger.error(f"记录测试图像到TensorBoard时出错: {e}")
@@ -702,26 +522,33 @@ def main():
                         logger.error(traceback.format_exc())
                 
                 # 测试后恢复进度条描述
-                pbar.set_description(f'Epoch {epoch}/{total_epochs}')
+                if opt['rank'] == 0:
+                    pbar.set_description(f'Epoch {epoch}/{total_epochs}')
                 
                 # 减少内存使用
                 if memory_efficient:
                     torch.cuda.empty_cache()
             
             train_data = prefetcher.next()
-            pbar.update(1)  # 更新进度条
         
         # 一个epoch结束，关闭进度条
-        pbar.close()
+        if opt['rank'] == 0:
+            pbar.close()
         
         if current_iter > total_iters:
             break
     
-    # 保存最终模型
-    logger.info('完成训练，保存最终模型...')
-    model.save(epoch=-1, current_iter=-1)  # -1标记为最终模型
+    # 保存最终模型 - 仅在主进程中
+    if opt['rank'] == 0:
+        logger.info('完成训练，保存最终模型...')
+        model.save(epoch=-1, current_iter=-1)  # -1标记为最终模型
     
-    if tb_logger:
+    # 等待所有进程
+    if opt.get('dist', False):
+        torch.distributed.barrier()
+    
+    # 清理资源 - 所有进程都执行
+    if tb_logger is not None:
         tb_logger.close()
     
     if prefetcher:

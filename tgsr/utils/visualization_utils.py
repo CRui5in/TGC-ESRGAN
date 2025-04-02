@@ -152,6 +152,7 @@ def generate_heatmap(attention_map):
         
         # 应用colormap
         heatmap = cv2.applyColorMap((attn * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        # 确保热力图是RGB格式
         heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
         
         # 转回tensor
@@ -192,7 +193,7 @@ def overlay_heatmap(image, heatmap, alpha=0.5):
     return torch.stack(overlays)
 
 def visualize_attention(model, images, text_prompt, device='cuda'):
-    """可视化模型注意力热力图
+    """可视化模型注意力热力图   
     
     Args:
         model: 模型实例
@@ -266,21 +267,33 @@ def log_image_with_attention(writer, tag, image_tensors, attention_map, global_s
     # 记录到TensorBoard
     writer.add_image(tag, grid, global_step)
 
-def log_metrics_to_tensorboard(writer, metrics, global_step, prefix='val/'):
+def log_metrics_to_tensorboard(writer, metrics, global_step, prefix='Validation/'):
     """记录评估指标到TensorBoard
     
     Args:
         writer: TensorBoard SummaryWriter实例
         metrics: 指标字典
         global_step: 全局步数
-        prefix: 指标前缀
+        prefix: 指标前缀，默认为'Validation/'
     """
     if writer is None or metrics is None:
         return
     
-    # 记录数值指标
-    for metric_name, metric_value in metrics.items():
-        writer.add_scalar(f'{prefix}{metric_name}', metric_value, global_step)
+    # 确保前缀以/结尾
+    if not prefix.endswith('/'):
+        prefix = prefix + '/'
+    
+    # 确保使用标准规范: Train/Validation/Test
+    if prefix.lower().startswith('val/'):
+        prefix = 'Validation/Metrics/'
+    elif prefix.lower().startswith('test/'):
+        prefix = 'Test/Metrics/'
+    elif prefix.lower().startswith('train/'):
+        prefix = 'Train/Metrics/'
+    else:
+        # 如果没有标准前缀，添加Metrics子目录
+        if not prefix.endswith('Metrics/'):
+            prefix = prefix + 'Metrics/'
     
     # 记录表格数据
     if len(metrics) > 0:
@@ -291,20 +304,22 @@ def log_metrics_to_tensorboard(writer, metrics, global_step, prefix='val/'):
                 formatted_value = f"{metric_value:.4f}" if isinstance(metric_value, float) else str(metric_value)
                 table_data.append([metric_name, formatted_value])
         
-        # 添加表格
+        # 添加表格，使用标准前缀
         if table_data:
+            # 确定表格前缀
+            table_prefix = prefix.split('/')[0] if '/' in prefix else prefix.rstrip('/')
             writer.add_text(
-                f'{prefix}metrics_table', 
+                f'{table_prefix}/Metrics_Table', 
                 '| Metric | Value |\n|---|---|\n' + '\n'.join([f'| {row[0]} | {row[1]} |' for row in table_data]), 
                 global_step
-            ) 
+            )
 
-def improved_tensor2img(tensor, rgb2bgr=True, out_type=np.uint8, min_max=(0, 1)):
+def improved_tensor2img(tensor, rgb2bgr=False, out_type=np.uint8, min_max=(0, 1)):
     """将tensor转换为图像numpy数组
     
     Args:
         tensor (Tensor | numpy.ndarray): 输入tensor或numpy数组
-        rgb2bgr (bool): 是否将RGB转换为BGR
+        rgb2bgr (bool): 是否将RGB转换为BGR，默认为False保持RGB格式
         out_type (numpy类型): 输出的numpy类型
         min_max (tuple[float]): 输入tensor的最小和最大值范围
             
@@ -397,3 +412,34 @@ def improved_tensor2img(tensor, rgb2bgr=True, out_type=np.uint8, min_max=(0, 1))
         
     else:
         raise TypeError(f'输入类型必须是tensor、numpy数组或tensor列表, 但得到{type(tensor)}') 
+
+def rgb_imwrite(img_path, img, params=None):
+    """以RGB格式写入图像，而不是默认的BGR格式
+    
+    Args:
+        img_path (str): 图像保存路径
+        img (numpy.ndarray): 需要保存的图像，RGB格式，[0, 255]，uint8或float32
+        params (list): OpenCV的imwrite参数
+    """
+    import os
+    import cv2
+    import numpy as np
+    
+    dir_name = os.path.abspath(os.path.dirname(img_path))
+    os.makedirs(dir_name, exist_ok=True)
+    
+    # 检查是否是RGB格式
+    if img.ndim == 3 and img.shape[2] == 3:
+        # 转换为BGR格式，因为OpenCV保存图像时使用BGR
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    else:
+        img_bgr = img
+    
+    # 确保uint8格式
+    if img.dtype == np.float32:
+        img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+    
+    # 保存图像
+    ok = cv2.imwrite(img_path, img, params if params is not None else [])
+    if not ok:
+        raise IOError(f"无法保存图像: {img_path}") 

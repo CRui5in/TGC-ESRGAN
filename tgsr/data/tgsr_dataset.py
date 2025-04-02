@@ -162,15 +162,18 @@ class TGSRDataset(Dataset):
         
         # 数据增强
         if self.transform is not None:
-            # 将numpy数组转换为PIL图像
+            # 将numpy数组转换为PIL图像，确保RGB顺序
             img_gt = (img_gt * 255).astype(np.uint8)
             if img_gt.shape[2] == 3:  # RGB图像
+                # 确保RGB顺序
+                img_gt = cv2.cvtColor(img_gt, cv2.COLOR_BGR2RGB)
                 img_gt = Image.fromarray(img_gt)
             else:  # 灰度图像
                 img_gt = Image.fromarray(img_gt[:, :, 0], mode='L')
+            
             # 应用变换（包括调整大小和ToTensor）
             img_gt = self.transform(img_gt)
-            
+        
         # 获取文本描述
         text_prompt = self.text_prompts.get(gt_path, '')
         

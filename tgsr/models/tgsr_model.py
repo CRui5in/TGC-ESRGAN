@@ -16,36 +16,14 @@ from typing import Optional, List, Dict, Tuple
 from contextlib import contextmanager
 import os
 import os.path as osp
-from basicsr.utils import get_root_logger, img2tensor
+from basicsr.utils import get_root_logger, USMSharp
 from basicsr.utils.img_util import imwrite
 from matplotlib import cm
 import matplotlib
 matplotlib.use('Agg')  # 非交互式后端
 
-def dict2str(opt, indent_level=0):
-    """将字典转换为格式化的字符串
-    
-    Args:
-        opt: 要转换的字典
-        indent_level: 缩进级别
-        
-    Returns:
-        str: 格式化后的字符串
-    """
-    msg = []
-    indent = '  ' * indent_level
-    
-    for k, v in opt.items():
-        if isinstance(v, dict):
-            msg.append(f'{indent}{k}:')
-            msg.append(dict2str(v, indent_level + 1))
-        else:
-            msg.append(f'{indent}{k}: {v}')
-            
-    return '\n'.join(msg)
-
-# 导入自定义的tensor2img替换原有的函数
 from tgsr.utils.visualization_utils import improved_tensor2img as tensor2img
+from tgsr.utils.visualization_utils import rgb_imwrite
 
 # 从tgsr_arch导入需要的类
 from tgsr.archs.tgsr_arch import (
@@ -225,6 +203,9 @@ class TGSRModel(SRModel):
         # 添加退化模块
         self.degradation = DegradationModule(opt['datasets']['train'])
         
+        # 添加USM锐化工具
+        self.usm_sharpener = USMSharp().cuda()
+        
         # 加载配置
         self.text_encoder_name = self.opt.get('text_encoder', {}).get('name', "/root/autodl-tmp/clip-vit-base-patch16")
         self.text_dim = self.opt.get('text_encoder', {}).get('text_dim', 512)
@@ -352,56 +333,71 @@ class TGSRModel(SRModel):
         Args:
             data: 包含lq (低分辨率), gt (高分辨率) 和 text_prompt (文本描述) 的字典
         """
-        self.lq = data['lq'].to(self.device)
-        if 'gt' in data:
+        if self.is_train:
+            # 训练数据合成
             self.gt = data['gt'].to(self.device)
             # 保存原始图像用于可视化
             self.original_gt = data['gt'].clone().detach()
+            # 对GT进行锐化
+            self.gt_usm = self.usm_sharpener(self.gt)
             
-            # 确保输入图像和GT图像的尺寸一致
-            if self.lq.shape[2:] != self.gt.shape[2:]:
-                self.lq = F.interpolate(
-                    self.lq,
-                    size=(self.gt.shape[2], self.gt.shape[3]),
-                    mode='bilinear',
-                    align_corners=False
-                )
+            # 应用退化操作
+            self.lq = self.degradation(self.gt_usm)
             
-        # 应用退化操作
-        if self.is_train:
-            self.lq = self.degradation(self.lq)
-            
-        # 抽取文本特征
-        if self.use_text_features:
-            text_prompts = data.get('text_prompt')
-            if text_prompts is not None:
-                # 使用CLIP编码文本
-                with torch.no_grad():
-                    text_hidden, text_pooled = self.text_encoder.encode_text(text_prompts, device=self.device)
+            # 抽取文本特征
+            if self.use_text_features:
+                text_prompts = data.get('text_prompt')
+                if text_prompts is not None:
+                    # 使用CLIP编码文本
+                    with torch.no_grad():
+                        text_hidden, text_pooled = self.text_encoder.encode_text(text_prompts, device=self.device)
+                        
+                    # 确保维度匹配 - 如果text_dim不匹配，调整维度
+                    if self.opt.get('network_g', {}).get('text_dim') != text_pooled.shape[-1]:
+                        text_dim = self.opt.get('network_g', {}).get('text_dim', 512)
+                        if text_pooled.shape[-1] > text_dim:
+                            # 降维情况
+                            if not hasattr(self, 'text_projector'):
+                                self.text_projector = nn.Linear(text_pooled.shape[-1], text_dim).to(self.device)
+                            text_pooled = self.text_projector(text_pooled)
+                            text_hidden = self.text_projector(text_hidden)
+                        else:
+                            # 升维情况
+                            text_pooled = F.pad(text_pooled, (0, text_dim - text_pooled.shape[-1]))
+                            text_hidden = F.pad(text_hidden, (0, text_dim - text_hidden.shape[-1]))
                     
-                # 确保维度匹配 - 如果text_dim不匹配，调整维度
-                if self.opt.get('network_g', {}).get('text_dim') != text_pooled.shape[-1]:
-                    text_dim = self.opt.get('network_g', {}).get('text_dim', 512)
-                    if text_pooled.shape[-1] > text_dim:
-                        # 降维情况
-                        if not hasattr(self, 'text_projector'):
-                            self.text_projector = nn.Linear(text_pooled.shape[-1], text_dim).to(self.device)
-                        text_pooled = self.text_projector(text_pooled)
-                        text_hidden = self.text_projector(text_hidden)
-                    else:
-                        # 升维情况
-                        text_pooled = F.pad(text_pooled, (0, text_dim - text_pooled.shape[-1]))
-                        text_hidden = F.pad(text_hidden, (0, text_dim - text_hidden.shape[-1]))
-                
-                # 保存文本特征以供模型使用
-                self.text_hidden = text_hidden
-                self.text_pooled = text_pooled
+                    # 保存文本特征以供模型使用
+                    self.text_hidden = text_hidden
+                    self.text_pooled = text_pooled
+            else:
+                # 如果不使用文本特征或无文本提示，使用零向量
+                batch_size = self.lq.shape[0]
+                text_dim = self.opt.get('network_g', {}).get('text_dim', 512)
+                self.text_hidden = torch.zeros((batch_size, 77, text_dim), device=self.device)  # 默认CLIP序列长度
+                self.text_pooled = torch.zeros((batch_size, text_dim), device=self.device)
         else:
-            # 如果不使用文本特征或无文本提示，使用零向量
-            batch_size = self.lq.shape[0]
-            text_dim = self.opt.get('network_g', {}).get('text_dim', 512)
-            self.text_hidden = torch.zeros((batch_size, 77, text_dim), device=self.device)  # 默认CLIP序列长度
-            self.text_pooled = torch.zeros((batch_size, text_dim), device=self.device)
+            # 验证或测试阶段
+            self.lq = data['lq'].to(self.device)
+            if 'gt' in data:
+                self.gt = data['gt'].to(self.device)
+                # 保存原始图像用于可视化
+                self.original_gt = data['gt'].clone().detach()
+                # 对GT进行锐化
+                self.gt_usm = self.usm_sharpener(self.gt)
+            
+            # 抽取文本特征
+            if self.use_text_features:
+                text_prompts = data.get('text_prompt')
+                if text_prompts is not None:
+                    with torch.no_grad():
+                        text_hidden, text_pooled = self.text_encoder.encode_text(text_prompts, device=self.device)
+                    self.text_hidden = text_hidden
+                    self.text_pooled = text_pooled
+            else:
+                batch_size = self.lq.shape[0]
+                text_dim = self.opt.get('network_g', {}).get('text_dim', 512)
+                self.text_hidden = torch.zeros((batch_size, 77, text_dim), device=self.device)
+                self.text_pooled = torch.zeros((batch_size, text_dim), device=self.device)
     
     def optimize_parameters(self, current_iter):
         """优化模型参数，执行反向传播和参数更新
@@ -809,11 +805,13 @@ class TGSRModel(SRModel):
             if hasattr(self, 'net_d') and self.net_d is not None:
                 self.net_d.eval()
             max_samples = self.opt['test'].get('max_test_samples', 1)
+            log_prefix = 'Test'
         else:
             self.net_g.eval()
             if hasattr(self, 'net_d') and self.net_d is not None:
                 self.net_d.eval()
             max_samples = self.opt['val'].get('max_val_samples', 1)
+            log_prefix = 'Validation'
         
         # 创建保存图像的目录
         if save_img:
@@ -882,35 +880,33 @@ class TGSRModel(SRModel):
                         test_y_channel=opt_['test_y_channel']))
             
             # 记录图像到TensorBoard
-            if tb_logger and idx == 0:  # 只记录第一个样本
-                # 记录原始图像
-                if hasattr(self, 'original_gt'):
-                    original_img = tensor2img(self.original_gt, rgb2bgr=False, min_max=(0, 1))
-                    if len(original_img.shape) == 2:
-                        original_img = np.stack([original_img] * 3, axis=-1)
-                    elif original_img.shape[-1] == 1:
-                        original_img = np.concatenate([original_img] * 3, axis=-1)
-                    original_img = torch.from_numpy(original_img).permute(2, 0, 1)
-                    tb_logger.add_image('images/original', original_img, current_iter)
+            if tb_logger is not None and idx == 0:  # 只记录第一个样本
+                # 使用规范的命名格式
+                # 取第一个样本并确保是RGB格式 (C,H,W)
+                lq_tensor = self.lq[0].detach().cpu().float().clamp_(0, 1)
+                output_tensor = self.output[0].detach().cpu().float().clamp_(0, 1)
+                gt_tensor = self.gt[0].detach().cpu().float().clamp_(0, 1)
                 
-                # 记录其他图像
-                for img_name, img in self.get_visualization().items():
-                    tb_logger.add_image(f'images/{img_name}', img, current_iter)
+                # 使用规范的命名 Test/Images/xxx 或 Validation/Images/xxx
+                tb_logger.add_image(f'{log_prefix}/Images/LQ', lq_tensor, current_iter)
+                tb_logger.add_image(f'{log_prefix}/Images/SR', output_tensor, current_iter)
+                tb_logger.add_image(f'{log_prefix}/Images/GT', gt_tensor, current_iter)
             
             # 保存图像
             if save_img:
                 img_name = osp.basename(val_data['lq_path'][0])
                 save_img_path = osp.join(save_dir, f'{img_name}')
-                save_imgs(self.output, save_img_path)
+                output_img = tensor2img(self.output, rgb2bgr=False, min_max=(0, 1))  # 确保不转换为BGR
+                rgb_imwrite(save_img_path, output_img)  # 使用rgb_imwrite确保保存为RGB格式
         
         # 计算平均指标
         for metric, opt_ in self.opt['val']['metrics'].items():
             self.metric_results[metric] = np.mean(self.metric_results[metric])
         
         # 记录到TensorBoard
-        if tb_logger:
+        if tb_logger is not None:
             for metric, value in self.metric_results.items():
-                tb_logger.add_scalar(f'val/{metric}', value, current_iter)
+                tb_logger.add_scalar(f'{log_prefix}/Metrics/{metric}', value, current_iter)
         
         # 恢复训练模式
         self.net_g.train()
@@ -1127,8 +1123,8 @@ class TGSRModel(SRModel):
         
         # 确保所有类型的损失都有记录，缺失的设为0
         for loss_type in all_loss_types:
-            # 前缀"train/losses/"确保它们分组在TensorBoard中
-            log_dict[f'train/losses/{loss_type}'] = current_loss.get(loss_type, 0.0)
+            # 使用规范的命名方式
+            log_dict[loss_type] = current_loss.get(loss_type, 0.0)
         
         # 其他可能的非损失日志项
         for k, v in self.log_dict.items():
@@ -1141,47 +1137,80 @@ class TGSRModel(SRModel):
     def log_current(self, current_iter, tb_logger, wandb_logger=None):
         """记录当前训练状态"""
         # 记录损失
-        for k, v in self.log_dict.items():
-            if isinstance(v, torch.Tensor):
-                v = v.item()
-            tb_logger.add_scalar(f'train/{k}', v, current_iter)
-            if wandb_logger is not None:
-                wandb_logger.log({f'train/{k}': v}, step=current_iter)
-        
+        for k, v in self.get_current_log().items():
+            tb_logger.add_scalar(f'Train/{k}', v, current_iter)
+            
         # 记录学习率
-        lr = self.get_current_learning_rate()
-        if lr is not None:
-            # 如果学习率是列表，取第一个值（生成器的学习率）
-            if isinstance(lr, list):
-                lr = lr[0]
-            tb_logger.add_scalar('train/learning_rate', lr, current_iter)
-            if wandb_logger is not None:
-                wandb_logger.log({'train/learning_rate': lr}, step=current_iter)
-        
-        # 记录图像
+        for k, v in self.get_current_learning_rate().items():
+            tb_logger.add_scalar(f'Train/learning_rate/{k}', v, current_iter)
+            
+        # 每隔一定迭代次数记录当前训练图像
         if current_iter % self.opt['logger']['save_training_image_freq'] == 0:
-            # 确保所有张量都有batch维度
-            if self.lq.dim() == 3:
-                self.lq = self.lq.unsqueeze(0)
-            if self.output.dim() == 3:
-                self.output = self.output.unsqueeze(0)
-            if self.gt.dim() == 3:
-                self.gt = self.gt.unsqueeze(0)
-            if hasattr(self, 'original_gt') and self.original_gt.dim() == 3:
-                self.original_gt = self.original_gt.unsqueeze(0)
-            
-            # 转换为图像并记录
-            lq_img = tensor2img(self.lq, rgb2bgr=False, min_max=(0, 1))
-            output_img = tensor2img(self.output, rgb2bgr=False, min_max=(0, 1))
-            gt_img = tensor2img(self.gt, rgb2bgr=False, min_max=(0, 1))
-            
-            tb_logger.add_image('images/lq', lq_img, current_iter)
-            tb_logger.add_image('images/output', output_img, current_iter)
-            tb_logger.add_image('images/gt', gt_img, current_iter)
-            
-            if hasattr(self, 'original_gt'):
-                original_img = tensor2img(self.original_gt, rgb2bgr=False, min_max=(0, 1))
-                tb_logger.add_image('images/original', original_img, current_iter)
+            try:
+                # 获取当前训练批次的图像
+                lq = self.lq[:1]  # 只取第一张图片
+                gt = self.gt[:1]
+                sr = self.output[:1]
+                
+                # 转换为numpy图像，保持RGB格式
+                lq_img = tensor2img(lq, rgb2bgr=False, min_max=(0, 1))  # [H, W, C] RGB
+                sr_img = tensor2img(sr, rgb2bgr=False, min_max=(0, 1))  # [H, W, C] RGB
+                gt_img = tensor2img(gt, rgb2bgr=False, min_max=(0, 1))  # [H, W, C] RGB
+                
+                # 将LQ图像放大到与SR图像相同的尺寸
+                if lq_img.shape[0] != sr_img.shape[0] or lq_img.shape[1] != sr_img.shape[1]:
+                    lq_img = cv2.resize(lq_img, (sr_img.shape[1], sr_img.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+                
+                # 确保GT图像与SR尺寸相同
+                if gt_img.shape[0] != sr_img.shape[0] or gt_img.shape[1] != sr_img.shape[1]:
+                    gt_img = cv2.resize(gt_img, (sr_img.shape[1], sr_img.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+                
+                # 添加文本标记
+                lq_img = self._add_text_marker(lq_img, 'LQ')
+                sr_img = self._add_text_marker(sr_img, 'SR')
+                gt_img = self._add_text_marker(gt_img, 'GT')
+                
+                # 横向拼接三个图像并添加水平空白间隔
+                h, w = sr_img.shape[:2]
+                spacer = np.ones((h, 10, 3), dtype=np.uint8) * 255  # 白色水平空白间隔
+                comparison = np.concatenate(
+                    [lq_img, spacer, sr_img, spacer, gt_img], 
+                    axis=1  # 使用axis=1进行水平拼接
+                )
+                
+                # 转换为CHW格式用于TensorBoard
+                comparison_chw = comparison.transpose(2, 0, 1)  # [C, H, W]
+                lq_chw = lq_img.transpose(2, 0, 1)  # [C, H, W]
+                sr_chw = sr_img.transpose(2, 0, 1)  # [C, H, W]
+                gt_chw = gt_img.transpose(2, 0, 1)  # [C, H, W]
+                
+                # 添加到TensorBoard，使用CHW格式
+                tb_logger.add_image('Train/images/comparison', comparison_chw, current_iter)
+                tb_logger.add_image('Train/images/LQ', lq_chw, current_iter)
+                tb_logger.add_image('Train/images/SR', sr_chw, current_iter)
+                tb_logger.add_image('Train/images/GT', gt_chw, current_iter)
+                
+                # 生成简单的热力图
+                diff_map = np.abs(sr_img.astype(np.float32) - gt_img.astype(np.float32))
+                diff_map = diff_map.mean(axis=2)  # 转为单通道
+                diff_map = diff_map / diff_map.max() * 255  # 归一化到0-255
+                
+                # 应用热力图颜色映射
+                heatmap = cv2.applyColorMap(diff_map.astype(np.uint8), cv2.COLORMAP_JET)
+                
+                # 将热力图与SR图像混合
+                overlay = cv2.addWeighted(sr_img, 0.7, heatmap, 0.3, 0)
+                
+                # 转换为CHW格式并添加到TensorBoard
+                overlay_chw = overlay.transpose(2, 0, 1)  # [C, H, W]
+                heatmap_chw = heatmap.transpose(2, 0, 1)  # [C, H, W]
+                tb_logger.add_image('Train/attention/diff_map', overlay_chw, current_iter)
+                tb_logger.add_image('Train/heatmap/diff_map', heatmap_chw, current_iter)
+                
+            except Exception as e:
+                self.logger.error(f"记录训练图像到TensorBoard时出错: {e}")
+                import traceback
+                self.logger.error(traceback.format_exc())
     
     def get_current_learning_rate(self):
         """获取当前的学习率
@@ -1198,7 +1227,7 @@ class TGSRModel(SRModel):
             if hasattr(self, 'optimizer_d'):
                 lrs.extend([param_group['lr'] for param_group in self.optimizer_d.param_groups])
                 
-            return lrs
+            return {f'lr_{i}': lr for i, lr in enumerate(lrs)}
         return None 
 
     def get_network_d(self):
@@ -1291,3 +1320,25 @@ class TGSRModel(SRModel):
             return MultiStepLR(optimizer, **kwargs)
         else:
             raise ValueError(f'不支持的调度器类型: {scheduler_type}') 
+
+def dict2str(opt, indent_level=0):
+    """将字典转换为格式化的字符串
+    
+    Args:
+        opt: 要转换的字典
+        indent_level: 缩进级别
+        
+    Returns:
+        str: 格式化后的字符串
+    """
+    msg = []
+    indent = '  ' * indent_level
+    
+    for k, v in opt.items():
+        if isinstance(v, dict):
+            msg.append(f'{indent}{k}:')
+            msg.append(dict2str(v, indent_level + 1))
+        else:
+            msg.append(f'{indent}{k}: {v}')
+            
+    return '\n'.join(msg) 

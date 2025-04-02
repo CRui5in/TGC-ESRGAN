@@ -393,6 +393,16 @@ if __name__ == "__main__":
     parser.add_argument('--max_images', type=int, default=None, help='每个划分最大处理的图像数量')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     args = parser.parse_args()
+
+    # 解压COCO数据集
+    coco_zip_dir = "/root/autodl-pub/COCO2017/"
+    extract_to = "/root/autodl-tmp/COCO2017/"
+
+    # 解压所有COCO压缩文件
+    for zip_file in os.listdir(coco_zip_dir):
+        if zip_file.endswith('.zip'):
+            zip_path = os.path.join(coco_zip_dir, zip_file)
+            extract_zip(zip_path, extract_to)
     
     # 设置随机种子
     set_seed(args.seed)
