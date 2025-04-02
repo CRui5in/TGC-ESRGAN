@@ -24,7 +24,7 @@ TGSR是一个基于文本引导的超分辨率模型框架，基于BasicSR框架
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/TGSR.git
+git clone https://github.com/CRui5in/TGSR.git
 cd TGSR
 
 # 安装依赖
@@ -49,16 +49,16 @@ image2.png    清晰的自然风景
 
 ```bash
 # 使用默认配置文件训练
-sh scripts/train_tgsr.sh
+sh scripts/start_training.sh
 
 # 指定配置文件训练
-sh scripts/train_tgsr.sh --opt options/my_config.yml
+sh scripts/start_training.sh --opt options/my_config.yml
 
 # 使用特定数量的GPU
-sh scripts/train_tgsr.sh --gpu 2
+sh scripts/start_training.sh --gpu 2
 
 # 启用内存优化
-sh scripts/train_tgsr.sh --memory_opt
+sh scripts/start_training.sh --memory_opt
 ```
 
 ### 恢复训练
