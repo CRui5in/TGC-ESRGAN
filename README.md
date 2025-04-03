@@ -24,7 +24,7 @@ TGSR是一个基于文本引导的超分辨率模型框架，基于BasicSR框架
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/TGSR.git
+git clone https://github.com/CRui5in/TGSR.git
 cd TGSR
 
 # 安装依赖
