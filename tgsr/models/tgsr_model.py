@@ -406,11 +406,12 @@ class TGSRModel(SRModel):
         Args:
             current_iter: 当前迭代次数
         """
-        # 清除之前的log_dict
-        self.log_dict = OrderedDict()
+        # 获取累积步数
+        accumulation_steps = self.opt.get('train', {}).get('accumulation_steps', 1)
         
-        # 清空优化器梯度
-        self.optimizer_g.zero_grad()
+        # 只在累积开始时清除日志字典
+        if current_iter % accumulation_steps == 1:
+            self.log_dict = OrderedDict()
         
         # 前向传播
         if self.use_text_features and hasattr(self, 'text_pooled'):
@@ -430,12 +431,14 @@ class TGSRModel(SRModel):
         # 计算像素损失(L1损失)
         if hasattr(self, 'cri_pix'):
             l_pix = self.cri_pix(self.output, self.gt_usm if self.is_train and self.opt['train'].get('use_sharp_gt', False) else self.gt)
+            # 缩放损失
+            l_pix = l_pix / accumulation_steps
             self.log_dict['l_pix'] = l_pix
         else:
             l_pix = torch.tensor(0.0, device=self.device)
             self.log_dict['l_pix'] = l_pix
             
-        # 计算感知损失(VGG特征损失)
+        # 计算感知损失和风格损失
         l_percep = torch.tensor(0.0, device=self.device)
         l_style = torch.tensor(0.0, device=self.device)
         
@@ -444,9 +447,9 @@ class TGSRModel(SRModel):
             if isinstance(perceptual_results, tuple) and len(perceptual_results) == 2:
                 l_percep_tmp, l_style_tmp = perceptual_results
                 if l_percep_tmp is not None:
-                    l_percep = l_percep_tmp
+                    l_percep = l_percep_tmp / accumulation_steps
                 if l_style_tmp is not None:
-                    l_style = l_style_tmp
+                    l_style = l_style_tmp / accumulation_steps
         
         self.log_dict['l_percep'] = l_percep
         self.log_dict['l_style'] = l_style
@@ -460,64 +463,58 @@ class TGSRModel(SRModel):
         # 默认GAN损失为0
         l_g_gan = torch.tensor(0.0, device=self.device)
         
-        # 如果到了开始GAN训练的迭代次数或有GAN损失记录
-        if current_iter > gan_start_iter or (hasattr(self, 'log_dict') and 'l_g_gan' in self.log_dict):
-            # 确保每次都更新判别器
-            if not hasattr(self, 'net_d') or self.net_d is None:
-                print('判别器未初始化，跳过GAN训练')
-                return
-            if not hasattr(self, 'cri_gan') or self.cri_gan is None:
-                print('GAN损失函数未初始化，跳过GAN训练')
-                return
-            
+        # 只在当前迭代超过gan_start_iter时才开始GAN训练
+        if current_iter > gan_start_iter:
             # 生成器对抗损失
             if hasattr(self, 'net_d') and self.net_d is not None:
                 fake_g_pred = self.net_d(self.output)
                 l_g_gan = self.cri_gan(fake_g_pred, True, is_disc=False)
+                l_g_gan = l_g_gan / accumulation_steps
                 l_g_total += l_g_gan
-                
-                # 添加GAN训练开始的日志
-                if current_iter == gan_start_iter + 1 or (hasattr(self, 'log_dict') and 'l_g_gan' in self.log_dict):
-                    print(f'开始GAN训练 (当前迭代次数: {current_iter})')
-                    self.log_dict['gan_start'] = 1.0  # 添加一个标记到日志中
-                else:
-                    self.log_dict['gan_start'] = 0.0
         
         self.log_dict['l_g_gan'] = l_g_gan
         self.log_dict['l_total'] = l_g_total
         
         # 执行反向传播
         l_g_total.backward()
-        self.optimizer_g.step()
         
-        # 判别器默认损失为0
-        l_d_real = torch.tensor(0.0, device=self.device)
-        l_d_fake = torch.tensor(0.0, device=self.device)
-        
-        # 判别器优化 - 仅在开始GAN训练后执行
-        if current_iter > gan_start_iter or (hasattr(self, 'log_dict') and 'l_g_gan' in self.log_dict):
-            # 确保每次都更新判别器
-            for p in self.net_d.parameters():
-                p.requires_grad = True
+        # 在累积完成后更新参数
+        if current_iter % accumulation_steps == 0:
+            self.optimizer_g.step()
+            self.optimizer_g.zero_grad()
+            
+            # 判别器优化 - 仅在累积完成后执行
+            if current_iter > gan_start_iter:
+                # 判别器默认损失为0
+                l_d_real = torch.tensor(0.0, device=self.device)
+                l_d_fake = torch.tensor(0.0, device=self.device)
                 
-            # 清空判别器梯度
-            self.optimizer_d.zero_grad()
-            
-            # 真实图像的判别器损失
-            real_d_pred = self.net_d(self.gt_usm if self.is_train and self.opt['train'].get('use_sharp_gt', False) else self.gt)
-            l_d_real = self.cri_gan(real_d_pred, True, is_disc=True)
-            
-            # 生成图像的判别器损失
-            fake_d_pred = self.net_d(self.output.detach())  # 分离计算图
-            l_d_fake = self.cri_gan(fake_d_pred, False, is_disc=True)
-            
-            # 判别器总损失
-            l_d_total = (l_d_real + l_d_fake) * 0.5
-            l_d_total.backward()
-            self.optimizer_d.step()
-        
-        self.log_dict['l_d_real'] = l_d_real
-        self.log_dict['l_d_fake'] = l_d_fake
+                # 确保每次都更新判别器
+                for p in self.net_d.parameters():
+                    p.requires_grad = True
+                    
+                # 清空判别器梯度
+                self.optimizer_d.zero_grad()
+                
+                # 真实图像的判别器损失
+                real_d_pred = self.net_d(self.gt_usm if self.is_train and self.opt['train'].get('use_sharp_gt', False) else self.gt)
+                l_d_real = self.cri_gan(real_d_pred, True, is_disc=True)
+                
+                # 生成图像的判别器损失
+                fake_d_pred = self.net_d(self.output.detach())  # 分离计算图
+                l_d_fake = self.cri_gan(fake_d_pred, False, is_disc=True)
+                
+                # 判别器总损失
+                l_d_total = (l_d_real + l_d_fake) * 0.5 / accumulation_steps
+                l_d_total.backward()
+                self.optimizer_d.step()
+                
+                self.log_dict['l_d_real'] = l_d_real
+                self.log_dict['l_d_fake'] = l_d_fake
+        else:
+            # 不是累积的最后一步，只需要清除判别器的梯度
+            if hasattr(self, 'optimizer_d'):
+                self.optimizer_d.zero_grad()
     
     def test(self):
         """测试过程，执行前向传播并保存注意力图"""

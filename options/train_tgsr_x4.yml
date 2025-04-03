@@ -76,7 +76,7 @@ datasets:
     gan_gt_usm: false
     
     # 数据加载配置
-    num_worker_per_gpu: 4  # worker数量
+    num_worker_per_gpu: 2  # worker数量
     batch_size_per_gpu: 1  # batch size
     dataset_enlarge_ratio: 5  # 每个epoch重复使用数据集的次数
 
@@ -211,6 +211,9 @@ train:
   
   # GAN训练配置
   gan_start_iter: 10000
+  
+  # 累积步数
+  accumulation_steps: 16  # 累积16次，相当于batch_size*16
 
 # 验证配置
 val:
