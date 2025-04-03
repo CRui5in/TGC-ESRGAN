@@ -7,7 +7,7 @@ manual_seed: 42
 use_amp: true  # 使用混合精度训练以节省显存
 use_ddp: true
 find_unused_parameters: true  # 添加此参数以解决分布式训练中未使用参数的问题
-gpu_ids: [0, 1, 2]
+gpu_ids: [0, 1]
 multiprocessing_start_method: spawn  # 添加多进程启动方法设置
 
 # 数据集配置
@@ -77,7 +77,7 @@ datasets:
     
     # 数据加载配置
     num_worker_per_gpu: 4  # worker数量
-    batch_size_per_gpu: 2  # batch size
+    batch_size_per_gpu: 1  # batch size
     dataset_enlarge_ratio: 5  # 每个epoch重复使用数据集的次数
 
   val:
