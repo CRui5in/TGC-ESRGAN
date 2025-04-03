@@ -377,6 +377,7 @@ def main():
     model = build_model(opt)
     start_epoch = 0
     current_iter = 0
+    resume_state = False
     
     # 恢复训练
     if opt['path'].get('resume_state'):
@@ -390,6 +391,7 @@ def main():
         current_iter = resume_state['iter']
         start_epoch = resume_state['epoch']
         logger.info(f"从迭代轮次 {current_iter} 恢复训练")
+        resume_state = True
     
     
     # 创建预取数据加载器
@@ -429,9 +431,18 @@ def main():
         
         # 只在主进程中显示进度条
         if opt['rank'] == 0:
-            pbar = tqdm(total=expected_iter, desc=f'Epoch {epoch}/{total_epochs}', 
-                      dynamic_ncols=True, unit='iter')
+            # 计算当前epoch的起始迭代次数
+            epoch_start_iter = current_iter
+            pbar = tqdm(total=expected_iter, 
+                      initial=current_iter - epoch_start_iter,
+                      desc=f'Epoch {epoch}/{total_epochs} (Iter {current_iter}/{total_iters})', 
+                      dynamic_ncols=True, 
+                      unit='iter')
         
+            if resume_state:
+                pbar.update(current_iter)
+                resume_state = False
+
         # 训练循环
         while train_data is not None:
             current_iter += 1
@@ -460,6 +471,8 @@ def main():
             # 更新进度条 - 仅在主进程中
             if opt['rank'] == 0:
                 pbar.update(1)
+                # 更新进度条描述，显示当前迭代次数和总迭代次数
+                pbar.set_description(f'Epoch {epoch}/{total_epochs} (Iter {current_iter}/{total_iters})')
             
             # 保存模型 - 仅在主进程中
             if opt['rank'] == 0 and current_iter % opt['logger']['save_checkpoint_freq'] == 0:
@@ -467,7 +480,7 @@ def main():
                 model.save(epoch, current_iter)
             
             # 验证 - 仅在特定迭代次数执行，并且current_iter > 0
-            if opt['rank'] == 0 and opt['val']['val_freq'] > 0 and current_iter % opt['val']['val_freq'] == 0 and current_iter > 0:
+            if opt['rank'] == 0 and opt['val']['val_freq'] > 0 and current_iter % opt['val']['val_freq'] == 0:
                 # 减少内存使用
                 if memory_efficient:
                     torch.cuda.empty_cache()
@@ -488,7 +501,7 @@ def main():
                     torch.cuda.empty_cache()
             
             # 测试 - 仅在特定迭代次数执行，并且current_iter > 0
-            if opt['rank'] == 0 and 'test' in opt and 'test_freq' in opt['test'] and opt['test']['test_freq'] > 0 and current_iter % opt['test']['test_freq'] == 0 and current_iter > 0:
+            if opt['rank'] == 0 and 'test' in opt and 'test_freq' in opt['test'] and opt['test']['test_freq'] > 0 and current_iter % opt['test']['test_freq'] == 0:
                 # 减少内存使用
                 if memory_efficient:
                     torch.cuda.empty_cache()

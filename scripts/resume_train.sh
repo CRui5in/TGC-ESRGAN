@@ -19,6 +19,7 @@ CHECKPOINT=""
 DEBUG=""
 MEMORY_OPT="--memory_opt"
 NUM_GPU=0  # 0表示自动检测
+REUSE_EXP_DIR=false  # 是否复用已有实验目录
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -57,13 +58,18 @@ while [[ $# -gt 0 ]]; do
             MEMORY_OPT=""
             shift
             ;;
+        --reuse-exp-dir)
+            REUSE_EXP_DIR=true
+            shift
+            ;;
         --help)
-            echo "用法: ./resume_train.sh --checkpoint CHECKPOINT_PATH [--opt CONFIG_FILE] [--debug] [--gpu NUM_GPU] [--no-memory-opt]"
+            echo "用法: ./resume_train.sh --checkpoint CHECKPOINT_PATH [--opt CONFIG_FILE] [--debug] [--gpu NUM_GPU] [--no-memory-opt] [--reuse-exp-dir]"
             echo "  --checkpoint PATH   指定恢复训练的检查点路径（必需）"
             echo "  --opt CONFIG_FILE   指定配置文件路径 (默认: options/train_tgsr_x4.yml)"
             echo "  --debug             启用调试模式"
             echo "  --gpu NUM_GPU       指定使用的GPU数量 (0: 自动检测)"
             echo "  --no-memory-opt     禁用内存优化"
+            echo "  --reuse-exp-dir     继续使用已存在的实验目录，避免创建新目录"
             echo "  --help              显示此帮助信息"
             exit 0
             ;;
@@ -122,16 +128,24 @@ python -c "import torch; torch.cuda.empty_cache()" 2>/dev/null || true
 
 # 启动TensorBoard
 echo "启动TensorBoard..."
-# 从配置文件中获取实验名称
-EXP_NAME=$(grep "name:" "$CONFIG" | head -n 1 | cut -d' ' -f2-)
-TB_DIR="${PROJECT_ROOT}/tb_logger/${EXP_NAME}"
+TB_DIR="${PROJECT_ROOT}/tb_logger"
 mkdir -p $TB_DIR
+
+# 检查是否有正在运行的TensorBoard进程
+TB_PID_FILE="${LOG_DIR}/tensorboard_pid.txt"
+if [ -f "$TB_PID_FILE" ]; then
+    OLD_TB_PID=$(cat "$TB_PID_FILE")
+    if kill -0 $OLD_TB_PID 2>/dev/null; then
+        echo "检测到正在运行的TensorBoard进程 (PID: $OLD_TB_PID)，将终止它"
+        kill $OLD_TB_PID 2>/dev/null || true
+    fi
+fi
 
 # 后台启动TensorBoard
 tensorboard --port 6007 --logdir $TB_DIR > "${LOG_DIR}/tensorboard_${TIMESTAMP}.log" 2>&1 &
 TB_PID=$!
 echo "TensorBoard已启动，PID: $TB_PID，访问地址: http://localhost:6007"
-echo $TB_PID > "${LOG_DIR}/tensorboard_pid.txt"
+echo $TB_PID > "$TB_PID_FILE"
 
 # 修改配置文件中的恢复路径
 TMP_CONFIG="${CONFIG}.tmp"
@@ -139,6 +153,12 @@ cp "$CONFIG" "$TMP_CONFIG"
 # 使用sed替换resume_state行
 sed -i "s|resume_state:.*|resume_state: $CHECKPOINT|g" "$TMP_CONFIG"
 echo "已设置恢复检查点: $CHECKPOINT"
+
+# 构建训练命令中添加参数
+REUSE_EXP_OPT=""
+if [ "$REUSE_EXP_DIR" = true ]; then
+    REUSE_EXP_OPT="--reuse_exp_dir"
+fi
 
 # 启动训练
 echo "开始恢复训练..."
@@ -150,13 +170,13 @@ if [ "$LAUNCHER" = "pytorch" ]; then
         "${PROJECT_ROOT}/tgsr/train.py" \
         --launcher pytorch \
         --opt $TMP_CONFIG \
-        $DEBUG $MEMORY_OPT > $LOG_FILE 2>&1 &
+        $DEBUG $MEMORY_OPT $REUSE_EXP_OPT > $LOG_FILE 2>&1 &
 else
     # 使用单GPU训练
     nohup python "${PROJECT_ROOT}/tgsr/train.py" \
         --launcher none \
         --opt $TMP_CONFIG \
-        $DEBUG $MEMORY_OPT > $LOG_FILE 2>&1 &
+        $DEBUG $MEMORY_OPT $REUSE_EXP_OPT > $LOG_FILE 2>&1 &
 fi
 
 TRAIN_PID=$!
@@ -164,4 +184,5 @@ echo "训练进程已在后台启动，PID: $TRAIN_PID"
 echo $TRAIN_PID > "${LOG_DIR}/train_pid.txt"
 
 echo "训练日志将保存到: $LOG_FILE"
-echo "使用 'tail -f $LOG_FILE' 查看训练日志" 
+echo "使用 'tail -f $LOG_FILE' 查看训练日志"
+echo "训练可以在TensorBoard中监控: http://localhost:6007" 

@@ -231,8 +231,8 @@ val:
 
 # 测试配置
 test:
-  test_freq: 50000
-  max_test_samples: 500
+  test_freq: 500000
+  max_test_samples: 3000
   metrics:
     psnr:
       type: calculate_psnr

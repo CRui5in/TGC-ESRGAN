@@ -1,3 +1,4 @@
+import math
 import random
 import torch
 import torch.nn as nn
@@ -428,7 +429,7 @@ class TGSRModel(SRModel):
         
         # 计算像素损失(L1损失)
         if hasattr(self, 'cri_pix'):
-            l_pix = self.cri_pix(self.output, self.gt)
+            l_pix = self.cri_pix(self.output, self.gt_usm if self.is_train and self.opt['train'].get('use_sharp_gt', False) else self.gt)
             self.log_dict['l_pix'] = l_pix
         else:
             l_pix = torch.tensor(0.0, device=self.device)
@@ -439,7 +440,7 @@ class TGSRModel(SRModel):
         l_style = torch.tensor(0.0, device=self.device)
         
         if hasattr(self, 'cri_perceptual'):
-            perceptual_results = self.cri_perceptual(self.output, self.gt)
+            perceptual_results = self.cri_perceptual(self.output, self.gt_usm if self.is_train and self.opt['train'].get('use_sharp_gt', False) else self.gt)
             if isinstance(perceptual_results, tuple) and len(perceptual_results) == 2:
                 l_percep_tmp, l_style_tmp = perceptual_results
                 if l_percep_tmp is not None:
@@ -459,8 +460,8 @@ class TGSRModel(SRModel):
         # 默认GAN损失为0
         l_g_gan = torch.tensor(0.0, device=self.device)
         
-        # 如果到了开始GAN训练的迭代次数且有相关组件
-        if current_iter > gan_start_iter:
+        # 如果到了开始GAN训练的迭代次数或有GAN损失记录
+        if current_iter > gan_start_iter or (hasattr(self, 'log_dict') and 'l_g_gan' in self.log_dict):
             # 确保每次都更新判别器
             if not hasattr(self, 'net_d') or self.net_d is None:
                 print('判别器未初始化，跳过GAN训练')
@@ -476,7 +477,7 @@ class TGSRModel(SRModel):
                 l_g_total += l_g_gan
                 
                 # 添加GAN训练开始的日志
-                if current_iter == gan_start_iter + 1:
+                if current_iter == gan_start_iter + 1 or (hasattr(self, 'log_dict') and 'l_g_gan' in self.log_dict):
                     print(f'开始GAN训练 (当前迭代次数: {current_iter})')
                     self.log_dict['gan_start'] = 1.0  # 添加一个标记到日志中
                 else:
@@ -494,7 +495,7 @@ class TGSRModel(SRModel):
         l_d_fake = torch.tensor(0.0, device=self.device)
         
         # 判别器优化 - 仅在开始GAN训练后执行
-        if current_iter > gan_start_iter:
+        if current_iter > gan_start_iter or (hasattr(self, 'log_dict') and 'l_g_gan' in self.log_dict):
             # 确保每次都更新判别器
             for p in self.net_d.parameters():
                 p.requires_grad = True
@@ -503,7 +504,7 @@ class TGSRModel(SRModel):
             self.optimizer_d.zero_grad()
             
             # 真实图像的判别器损失
-            real_d_pred = self.net_d(self.gt)
+            real_d_pred = self.net_d(self.gt_usm if self.is_train and self.opt['train'].get('use_sharp_gt', False) else self.gt)
             l_d_real = self.cri_gan(real_d_pred, True, is_disc=True)
             
             # 生成图像的判别器损失
@@ -880,7 +881,7 @@ class TGSRModel(SRModel):
                         test_y_channel=opt_['test_y_channel']))
             
             # 记录图像到TensorBoard
-            if tb_logger is not None and idx == 0:  # 只记录第一个样本
+            if tb_logger is not None and idx < 3:  # 记录前3个样本
                 # 使用规范的命名格式
                 # 取第一个样本并确保是RGB格式 (C,H,W)
                 lq_tensor = self.lq[0].detach().cpu().float().clamp_(0, 1)
@@ -888,9 +889,26 @@ class TGSRModel(SRModel):
                 gt_tensor = self.gt[0].detach().cpu().float().clamp_(0, 1)
                 
                 # 使用规范的命名 Test/Images/xxx 或 Validation/Images/xxx
-                tb_logger.add_image(f'{log_prefix}/Images/LQ', lq_tensor, current_iter)
-                tb_logger.add_image(f'{log_prefix}/Images/SR', output_tensor, current_iter)
-                tb_logger.add_image(f'{log_prefix}/Images/GT', gt_tensor, current_iter)
+                tb_logger.add_image(f'{log_prefix}/Images/LQ_{idx+1}', lq_tensor, current_iter)
+                tb_logger.add_image(f'{log_prefix}/Images/SR_{idx+1}', output_tensor, current_iter)
+                tb_logger.add_image(f'{log_prefix}/Images/GT_{idx+1}', gt_tensor, current_iter)
+            
+            # 生成热力图
+            diff_map = np.abs(output_np.astype(np.float32) - gt_np.astype(np.float32))
+            diff_map = diff_map.mean(axis=2)  # 转为单通道
+            diff_map = diff_map / diff_map.max() * 255  # 归一化到0-255
+            
+            # 应用热力图颜色映射
+            heatmap = cv2.applyColorMap(diff_map.astype(np.uint8), cv2.COLORMAP_JET)
+            
+            # 将热力图与SR图像混合
+            overlay = cv2.addWeighted(output_np, 0.7, heatmap, 0.3, 0)
+            
+            # 转换为CHW格式并添加到TensorBoard
+            overlay_chw = overlay.transpose(2, 0, 1)  # [C, H, W]
+            heatmap_chw = heatmap.transpose(2, 0, 1)  # [C, H, W]
+            tb_logger.add_image(f'{log_prefix}/Images/heatmap_{idx+1}', overlay_chw, current_iter)
+            tb_logger.add_image(f'{log_prefix}/Images/diff_map_{idx+1}', heatmap_chw, current_iter)
             
             # 保存图像
             if save_img:
@@ -1279,8 +1297,8 @@ class TGSRModel(SRModel):
         decay = 0.999  # 默认衰减率
         if current_iter is not None:
             # 调整衰减率，可以根据迭代次数动态调整
-            ema_start = self.opt.get('train', {}).get('ema_start', 20000)
-            if current_iter < ema_start:
+            ema_start = self.opt.get('train', {}).get('ema_start', 5000)
+            if current_iter < ema_start and not hasattr(self, 'net_g_ema'):
                 return
                 
         # 对所有参数应用EMA更新
