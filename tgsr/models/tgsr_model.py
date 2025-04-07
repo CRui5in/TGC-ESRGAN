@@ -225,10 +225,14 @@ class TGSRModel(SRModel):
                 self.freeze_text_encoder()
         
         # 注册额外的ema模型，如果需要
-        if self.is_train and self.opt.get('use_ema', False):
+        if self.is_train and self.opt.get('train', {}).get('use_ema', False):
             self.net_g_ema = self.model_to_device(self.net_g)
+            # 记录EMA相关参数
+            self.logger = get_root_logger()
+            ema_decay = self.opt.get('train', {}).get('ema_decay', 0.999)
+            self.logger.info(f'初始化EMA模型，衰减率: {ema_decay}')
             # 深度复制net_g参数到net_g_ema
-            self.model_ema(0)
+            self.accumulate(self.net_g_ema, self.net_g, decay=0)  # 使用0衰减值进行完全复制
             self.net_g_ema.eval()
             
         # 初始化GAN相关组件
@@ -804,12 +808,25 @@ class TGSRModel(SRModel):
                 self.net_d.eval()
             max_samples = self.opt['test'].get('max_test_samples', 1)
             log_prefix = 'Test'
+            # 检查是否使用EMA模型进行测试
+            use_ema = self.opt.get('test', {}).get('use_ema', False)
         else:
             self.net_g.eval()
             if hasattr(self, 'net_d') and self.net_d is not None:
                 self.net_d.eval()
             max_samples = self.opt['val'].get('max_val_samples', 1)
             log_prefix = 'Validation'
+            # 检查是否使用EMA模型进行验证
+            use_ema = self.opt.get('val', {}).get('use_ema', False)
+        
+        # 如果启用了EMA且存在EMA模型，则使用EMA模型进行评估
+        if use_ema and hasattr(self, 'net_g_ema'):
+            # 保存当前训练模型
+            net_g_backup = self.net_g
+            # 使用EMA模型
+            self.net_g = self.net_g_ema
+            logger = get_root_logger()
+            logger.info(f'使用EMA模型进行{log_prefix.lower()}...')
         
         # 创建保存图像的目录
         if save_img:
@@ -922,6 +939,11 @@ class TGSRModel(SRModel):
         if tb_logger is not None:
             for metric, value in self.metric_results.items():
                 tb_logger.add_scalar(f'{log_prefix}/Metrics/{metric}', value, current_iter)
+        
+        # 如果使用了EMA模型，恢复原始训练模型
+        if use_ema and hasattr(self, 'net_g_ema'):
+            # 恢复原始训练模型
+            self.net_g = net_g_backup
         
         # 恢复训练模式
         self.net_g.train()
@@ -1290,12 +1312,13 @@ class TGSRModel(SRModel):
         if not hasattr(self, 'net_g_ema'):
             return
             
-        # 根据当前迭代次数确定衰减率
-        decay = 0.999  # 默认衰减率
+        # 从配置中获取EMA衰减率
+        decay = self.opt.get('train', {}).get('ema_decay', 0.999)  # 使用配置中的值
+        
         if current_iter is not None:
-            # 调整衰减率，可以根据迭代次数动态调整
+            # 根据当前迭代次数确定是否应该开始EMA
             ema_start = self.opt.get('train', {}).get('ema_start', 5000)
-            if current_iter < ema_start and not hasattr(self, 'net_g_ema'):
+            if current_iter < ema_start:
                 return
                 
         # 对所有参数应用EMA更新

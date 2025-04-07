@@ -76,9 +76,9 @@ datasets:
     gan_gt_usm: false
     
     # 数据加载配置
-    num_worker_per_gpu: 2  # worker数量
+    num_worker_per_gpu: 4  # worker数量
     batch_size_per_gpu: 1  # batch size
-    dataset_enlarge_ratio: 5  # 每个epoch重复使用数据集的次数
+    dataset_enlarge_ratio: 1  # 每个epoch重复使用数据集的次数
 
   val:
     name: TGSR_Val
@@ -172,28 +172,27 @@ train:
     gan_type: vanilla
     real_label_val: 1.0
     fake_label_val: 0.0
-    loss_weight: !!float 1e-3
+    loss_weight: !!float 1e-1
   
   # 生成器优化器配置
   optim_g:
     type: Adam
-    lr: !!float 2e-4
+    lr: !!float 1e-4
     weight_decay: 0
     betas: [0.9, 0.99]
     
   # 判别器优化器配置
   optim_d:
     type: Adam
-    lr: !!float 2e-4
+    lr: !!float 1e-4
     weight_decay: 0
     betas: [0.9, 0.99]
   
   # 学习率调度器
   scheduler:
-    type: CosineAnnealingRestartLR
-    periods: [250000, 250000, 250000, 250000]
-    restart_weights: [1, 1, 1, 1]
-    eta_min: !!float 1e-7
+    type: MultiStepLR  # 改用MultiStepLR，更稳定
+    milestones: [200000, 400000, 600000]
+    gamma: 0.5
   
   # 重要的训练配置
   total_iter: 1000000
@@ -205,6 +204,7 @@ train:
   # EMA配置
   use_ema: true
   ema_start: 5000
+  ema_decay: 0.999
   
   # 内存优化配置
   memory_efficient: true
@@ -213,7 +213,7 @@ train:
   gan_start_iter: 10000
   
   # 累积步数
-  accumulation_steps: 16  # 累积16次，相当于batch_size*16
+  accumulation_steps: 2  # 累积16次，相当于batch_size*16
 
 # 验证配置
 val:
@@ -222,29 +222,31 @@ val:
   save_visualization: false
   use_original_size: true
   max_val_samples: 100
+  use_ema: true
   metrics:
     psnr:
       type: calculate_psnr
       crop_border: 4
-      test_y_channel: true
+      test_y_channel: false
     ssim:
       type: calculate_ssim
       crop_border: 4
-      test_y_channel: true
+      test_y_channel: false
 
 # 测试配置
 test:
   test_freq: 500000
   max_test_samples: 3000
+  use_ema: true
   metrics:
     psnr:
       type: calculate_psnr
       crop_border: 4
-      test_y_channel: true
+      test_y_channel: false
     ssim:
       type: calculate_ssim
       crop_border: 4
-      test_y_channel: true
+      test_y_channel: false
 
 # 日志配置
 logger:

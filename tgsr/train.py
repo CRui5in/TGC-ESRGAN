@@ -368,7 +368,19 @@ def main():
     logger.info(f'混合精度训练: {opt["train"].get("fp16", False)}')
     logger.info(f'TensorBoard记录器状态: {"已启用" if tb_logger else "未启用"}')
     logger.info(f'EMA: {opt["train"].get("use_ema", False)}')
+    if opt["train"].get("use_ema", False):
+        logger.info(f'EMA衰减率: {opt["train"].get("ema_decay", 0.999)}')
     logger.info(f'文本编码器: {opt.get("text_encoder", {}).get("name", "未设置")}')
+    
+    # 记录梯度累积配置
+    accumulation_steps = opt["train"].get("accumulation_steps", 1)
+    if accumulation_steps > 1:
+        logger.info(f'使用梯度累积，步数: {accumulation_steps}')
+        effective_batch_size = opt["datasets"]["train"]["batch_size_per_gpu"] * accumulation_steps * opt["world_size"]
+        logger.info(f'等效批量大小: {effective_batch_size} (batch_size_per_gpu * accumulation_steps * world_size)')
+    else:
+        logger.info(f'未使用梯度累积')
+        logger.info(f'批量大小: {opt["datasets"]["train"]["batch_size_per_gpu"] * opt["world_size"]} (batch_size_per_gpu * world_size)')
     
     # 创建数据加载器
     train_loader, train_sampler, val_loader, total_epochs, total_iters = create_train_val_dataloader(opt, logger)
