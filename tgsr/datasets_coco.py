@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from pycocotools.coco import COCO
+from pycocotools import mask as mask_util
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 检查是否有可用的GPU
@@ -50,6 +51,17 @@ def get_captions_for_image(image_id, coco_captions):
     return [ann['caption'] for ann in anns]
 
 
+# 编码掩码为Run-Length编码格式
+def encode_mask(mask):
+    """将二维掩码编码为Run-Length编码格式"""
+    # 使用pycocotools的RLE编码
+    mask = np.asfortranarray(mask.astype(np.uint8))
+    rle = mask_util.encode(mask)
+    if isinstance(rle['counts'], bytes):
+        rle['counts'] = rle['counts'].decode('utf-8')
+    return rle
+
+
 # 转换图像为张量
 def img_to_tensor(img, device=None):
     """将OpenCV图像转换为PyTorch张量"""
@@ -82,9 +94,9 @@ def resize_image(image, target_size=None, scale_factor=None):
     - 调整大小后的图像
     """
     if target_size is not None:
-        return cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+        return cv2.resize(image, target_size, interpolation=cv2.INTER_LANCZOS4)
     elif scale_factor is not None:
-        return cv2.resize(image, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
+        return cv2.resize(image, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_LANCZOS4)
     return image
 
 
@@ -162,6 +174,10 @@ def process_image(img_id, coco_instance, coco_captions, category_map, coco_dir, 
     try:
         # 获取图像信息
         img_info = coco_instance.loadImgs(img_id)[0]
+        
+        # 获取原始图像尺寸
+        original_width = img_info['width']
+        original_height = img_info['height']
 
         # 确定图像路径
         img_path = os.path.join(coco_dir, "train2017", img_info['file_name'])
@@ -177,44 +193,67 @@ def process_image(img_id, coco_instance, coco_captions, category_map, coco_dir, 
             print(f"跳过非彩色图像: {img_path}, shape: {image.shape}")
             return []
 
-        # 可选: 调整图像大小以节省空间
-        if resize_scale is not None and resize_scale != 1.0:
-            image = resize_image(image, scale_factor=resize_scale)
-
-        # 获取图像的captions
+        # 获取图像的所有captions
         captions = get_captions_for_image(img_id, coco_captions)
         if not captions:
             return []  # 没有captions跳过
 
-        # 随机选择一个caption
-        caption = random.choice(captions)
+        # 合并所有captions，用逗号分隔
+        combined_caption = " ".join(captions)
 
         # 获取图像中的所有实例标注
         ann_ids = coco_instance.getAnnIds(imgIds=img_id)
         anns = coco_instance.loadAnns(ann_ids)
+
+        # 创建对象信息列表，包含分割掩码
+        objects_info = []
+        for ann in anns:
+            cat_id = ann['category_id']
+            if cat_id in category_map:
+                obj_name = category_map[cat_id]
+                
+                # 获取分割掩码
+                mask = coco_instance.annToMask(ann)
+                
+                # 如果掩码非空
+                if np.sum(mask) > 0:
+                    # 计算边界框
+                    bbox = ann.get('bbox', [0, 0, 0, 0])  # [x, y, width, height]
+                    
+                    # 保存对象信息，包括分割掩码
+                    objects_info.append({
+                        'category': obj_name,
+                        'bbox': bbox,
+                        'area': float(ann.get('area', 0)),
+                        'mask_encoded': encode_mask(mask)
+                    })
 
         # 确定输出路径
         image_id = f"{img_id:012d}"
         split_dir = os.path.join(output_dir, split_name)
         hr_path = os.path.join(split_dir, "hr", f"{image_id}.jpg")
 
+        # 可选: 调整图像大小以节省空间，使用高质量调整
+        resized_width = original_width
+        resized_height = original_height
+        if resize_scale is not None and resize_scale != 1.0:
+            # 使用LANCZOS插值获得高质量调整
+            image = resize_image(image, scale_factor=resize_scale)
+            resized_width = int(original_width * resize_scale)
+            resized_height = int(original_height * resize_scale)
+
         # 保存高分辨率图像 (原始图像)
         cv2.imwrite(hr_path, image, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
 
-        # 记录标注的对象类别
-        objects = []
-        for ann in anns:
-            cat_id = ann['category_id']
-            if cat_id in category_map:
-                objects.append(category_map[cat_id])
-
-        # 记录样本信息
+        # 记录样本信息，包含详细对象信息和尺寸
         sample_info = {
             "image_id": image_id,
             "original_id": img_id,
-            "caption": caption,
-            "objects": list(set(objects)),  # 去重
+            "caption": combined_caption,
+            "objects": objects_info,
             "hr_path": hr_path,
+            "original_width": original_width,
+            "original_height": original_height,
             "split": split_name
         }
 
@@ -355,9 +394,10 @@ def create_tgsr_dataset(coco_dir, output_dir, jpeg_quality=90, resize_scale=None
     object_counts = {}
     for item in split_samples["train"]:
         for obj in item["objects"]:
-            if obj not in object_counts:
-                object_counts[obj] = 0
-            object_counts[obj] += 1
+            category = obj["category"]
+            if category not in object_counts:
+                object_counts[category] = 0
+            object_counts[category] += 1
 
     # 输出对象分布
     print("\n训练集对象分布:")
@@ -399,10 +439,10 @@ if __name__ == "__main__":
     extract_to = "/root/autodl-tmp/COCO2017/"
 
     # 解压所有COCO压缩文件
-    for zip_file in os.listdir(coco_zip_dir):
-        if zip_file.endswith('.zip'):
-            zip_path = os.path.join(coco_zip_dir, zip_file)
-            extract_zip(zip_path, extract_to)
+    # for zip_file in os.listdir(coco_zip_dir):
+    #     if zip_file.endswith('.zip'):
+    #         zip_path = os.path.join(coco_zip_dir, zip_file)
+    #         extract_zip(zip_path, extract_to)
     
     # 设置随机种子
     set_seed(args.seed)
