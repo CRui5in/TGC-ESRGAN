@@ -1,0 +1,238 @@
+# general settings
+name: train_TGSRx4plus_400k_B12G4
+model_type: TGSRModel
+scale: 4
+num_gpu: auto  # auto: can infer from your visible devices automatically
+manual_seed: 0
+
+# ----------------- options for synthesizing training data in TGSRModel ----------------- #
+# USM the ground-truth
+l1_gt_usm: True
+percep_gt_usm: True
+gan_gt_usm: False
+
+# the first degradation process
+resize_prob: [0.2, 0.7, 0.1]  # up, down, keep
+resize_range: [0.15, 1.5]
+gaussian_noise_prob: 0.5
+noise_range: [1, 30]
+poisson_scale_range: [0.05, 3]
+gray_noise_prob: 0.4
+jpeg_range: [30, 95]
+
+# the second degradation process
+second_blur_prob: 0.8
+resize_prob2: [0.3, 0.4, 0.3]  # up, down, keep
+resize_range2: [0.3, 1.2]
+gaussian_noise_prob2: 0.5
+noise_range2: [1, 25]
+poisson_scale_range2: [0.05, 2.5]
+gray_noise_prob2: 0.4
+jpeg_range2: [30, 95]
+
+
+gt_size: 256
+queue_size: 144  # 减小队列大小以减少内存使用
+
+# 全局设置
+# use_text_features: true  # 是否使用文本特征 - 已移动到顶层
+
+# -------------- CLIP text encoder settings -------------- #
+text_encoder:
+  name: /root/autodl-tmp/clip-vit-base-patch32
+  text_dim: 512
+  freeze: true
+
+# dataset and data loader settings
+datasets:
+  train:
+    name: TGSR_train
+    type: TGSRDataset_basicsr
+    dataroot_gt: /root/autodl-tmp/tgsr_dataset_hr_only/train/hr
+    text_file: /root/autodl-tmp/tgsr_dataset_hr_only/train_captions.json
+    io_backend:
+      type: disk
+
+    blur_kernel_size: 21
+    kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    sinc_prob: 0.1
+    blur_sigma: [0.2, 3]
+    betag_range: [0.5, 4]
+    betap_range: [1, 2]
+
+    blur_kernel_size2: 21
+    kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    sinc_prob2: 0.1
+    blur_sigma2: [0.2, 1.5]
+    betag_range2: [0.5, 4]
+    betap_range2: [1, 2]
+
+    final_sinc_prob: 0.8
+
+    
+    # ----------------- 文本区域特定退化参数 ----------------- #
+    use_targeted_degradation: true
+    # 模糊参数 - 文本区域使用较轻的模糊效果
+    text_blur:
+      kernel_size: 11       # 文本区域模糊核大小，较小的核尺寸产生更轻微的模糊
+      center_weight: 0.7    # 中心点权重，原值3.0导致图像过亮，现降至0.7保持轻度模糊效果
+      surround_weight: 0.003 # 周围点权重，调整为使卷积核总和约为1.0 (0.7 + 120*0.0025 ≈ 1.0)
+
+    # 噪声参数 - 文本区域使用较轻的噪声
+    text_noise:
+      strength_factor: 0.5  # 文本区域噪声强度因子，相对于非文本区域（值越小噪声越轻）
+
+    # JPEG压缩参数 - 文本区域使用较高的质量
+    text_jpeg:
+      quality_min_factor: 2.5  # 文本区域最小JPEG质量提升因子（值越大质量越高）
+      quality_max_factor: 1.2  # 文本区域最大JPEG质量提升因子
+      quality_max: 95          # 文本区域JPEG质量上限，避免超过100
+
+      gt_size: 256
+      use_hflip: True
+      use_rot: False
+
+    # data loader
+    use_shuffle: true
+    num_worker_per_gpu: 2  # 减少工作线程以减轻CPU负担
+    batch_size_per_gpu: 1  # 减小批次大小减少内存峰值
+    dataset_enlarge_ratio: 1
+    prefetch_mode: cuda  # 使用CUDA进行预取
+    pin_memory: true  # 启用pin_memory加速数据传输
+
+  val:
+    name: TGSR_val
+    type: TGSRDataset_basicsr
+    dataroot_gt: /root/autodl-tmp/tgsr_dataset_hr_only/val/hr
+    text_file: /root/autodl-tmp/tgsr_dataset_hr_only/val_captions.json
+    io_backend:
+      type: disk
+    gt_size: 256
+    use_hflip: False
+    use_rot: False
+    num_worker_per_gpu: 2
+    batch_size_per_gpu: 1
+
+# network structures
+# SR网络 - 使用标准RRDBNet
+network_g:
+  type: RRDBNet
+  num_in_ch: 3
+  num_out_ch: 3
+  num_feat: 64
+  num_block: 23
+  num_grow_ch: 32
+  scale: 4
+
+# 文本引导网络 - 独立模块
+network_t:
+  type: TextGuidanceNet
+  num_feat: 64  # 与SR网络的特征通道匹配
+  text_dim: 512  # CLIP文本特征维度
+  num_blocks: 3  # 文本注意力块数量
+  num_heads: 8   # 多头注意力头数
+
+# 判别器网络
+network_d:
+  type: UNetDiscriminatorSN
+  num_in_ch: 3
+  num_feat: 64
+  skip_connection: True
+
+# path
+path:
+  # 预训练权重
+  pretrain_network_g: /root/autodl-tmp/TGSR/RealESRNet_x4plus.pth
+  param_key_g: params_ema
+  strict_load_g: true
+  resume_state: ~
+  experiments_root: /root/autodl-tmp/TGSR/experiments
+
+# training settings
+train:
+  ema_decay: 0.999
+  optim_g:
+    type: Adam
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  optim_d:
+    type: Adam
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  optim_t:
+    type: Adam
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [400000]
+    gamma: 0.5
+
+  total_iter: 400000
+  warmup_iter: -1  # no warm up
+
+  # losses
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+  # perceptual loss (content and style losses)
+  perceptual_opt:
+    type: PerceptualLoss
+    layer_weights:
+      # before relu
+      'conv1_2': 0.1
+      'conv2_2': 0.1
+      'conv3_4': 1
+      'conv4_4': 1
+      'conv5_4': 1
+    vgg_type: vgg19
+    use_input_norm: true
+    perceptual_weight: !!float 1.0
+    style_weight: 0
+    range_norm: false
+    criterion: l1
+  # gan loss
+  gan_opt:
+    type: GANLoss
+    gan_type: vanilla
+    real_label_val: 1.0
+    fake_label_val: 0.0
+    loss_weight: !!float 1e-1
+
+  net_d_iters: 1
+  net_d_init_iters: 0
+
+# validation settings
+val:
+  val_freq: !!float 5e3  # 减少验证频率，提高训练效率
+  save_img: True
+  metrics:
+    psnr: # metric name
+      type: calculate_psnr
+      crop_border: 4
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 4
+      test_y_channel: false
+
+# logging settings
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 5e3
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500 
