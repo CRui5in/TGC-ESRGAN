@@ -356,6 +356,21 @@ class TGSRModel(SRGANModel):
             self.use_targeted_degradation = False
             print("无掩码数据，使用标准退化")
         
+        # 解码对象信息（如果有）
+        self.objects_info = None
+        if 'objects_info_str' in data:
+            try:
+                import json
+                # 将批次中的每个JSON字符串解码为Python对象
+                batch_objects = []
+                for obj_str in data['objects_info_str']:
+                    batch_objects.append(json.loads(obj_str))
+                self.objects_info = batch_objects
+            except Exception as e:
+                logger = get_root_logger()
+                logger.warning(f"解析对象信息失败: {e}")
+                self.objects_info = None
+        
         if self.is_train and self.opt.get('high_order_degradation', True):
             # 训练数据合成
             self.gt = data['gt'].to(self.device)
@@ -1326,7 +1341,9 @@ class TGSRModel(SRGANModel):
 
         # 使用累积批次大小进行归一化
         l_g_total = l_g_total / self.accumulate_grad_batches
-        l_g_total.backward()
+        # 如果有文本引导网络，保留计算图以便后续的反向传播
+        retain_graph = self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t')
+        l_g_total.backward(retain_graph=retain_graph)
         
         # 文本引导网络损失
         l_t_total = 0
@@ -1355,10 +1372,35 @@ class TGSRModel(SRGANModel):
                     if isinstance(attn_maps, list) and len(attn_maps) > 0:
                         # 使用最后一个注意力图（通常最精细）
                         attn_map = attn_maps[-1]
-                        l_t_attn = self.cri_attention(attn_map, self.text_prompts, objects_info, self.device)
-                        l_t_attn = l_t_attn / self.accumulate_grad_batches  # 归一化
-                        l_t_total += l_t_attn
-                        loss_dict[f'l_t_attn_{pos}'] = l_t_attn
+                        
+                        # 使用逐样本处理方式处理objects_info
+                        batch_size = attn_map.size(0)
+                        l_t_attn_batch = 0
+                        valid_samples = 0
+                        
+                        for i in range(batch_size):
+                            # 获取当前样本的文本提示和对象信息
+                            sample_text = [self.text_prompts[i]]
+                            sample_objects = [objects_info[i]] if i < len(objects_info) else [[]]
+                            sample_attn_map = attn_map[i:i+1]
+                            
+                            # 对单个样本进行处理
+                            try:
+                                sample_loss = self.cri_attention(sample_attn_map, sample_text, sample_objects, self.device)
+                                
+                                # 只有当样本损失有效时才累加
+                                if sample_loss.item() > 0:
+                                    l_t_attn_batch += sample_loss
+                                    valid_samples += 1
+                            except Exception:
+                                continue
+                        
+                        # 计算批次平均损失
+                        if valid_samples > 0:
+                            l_t_attn = l_t_attn_batch / valid_samples
+                            l_t_attn = l_t_attn / self.accumulate_grad_batches  # 归一化
+                            l_t_total += l_t_attn
+                            loss_dict[f'l_t_attn_{pos}'] = l_t_attn
             
             # 3. 特征细化损失
             if (hasattr(self, 'cri_refinement') and hasattr(self, 'original_features_cache') 

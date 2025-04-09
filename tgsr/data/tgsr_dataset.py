@@ -13,7 +13,29 @@ from basicsr.data.transforms import augment
 from basicsr.utils import FileClient, get_root_logger, imfrombytes, img2tensor
 from basicsr.utils.registry import DATASET_REGISTRY
 from torch.utils import data as data
+from torch.utils.data.dataloader import default_collate
 from pycocotools import mask as mask_util
+
+
+def bytes_to_string_json_safe(obj):
+    """递归地将嵌套数据结构中的bytes对象转换为字符串，使其可以被JSON序列化
+    
+    Args:
+        obj: 要转换的对象，可以是任何Python数据类型
+        
+    Returns:
+        转换后的对象，其中所有bytes已转换为字符串
+    """
+    if isinstance(obj, bytes):
+        return obj.decode('utf-8', errors='replace')
+    elif isinstance(obj, list):
+        return [bytes_to_string_json_safe(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {k: bytes_to_string_json_safe(v) for k, v in obj.items()}
+    elif hasattr(obj, '__dict__'):  # 对象类型
+        return bytes_to_string_json_safe(obj.__dict__)
+    else:
+        return obj
 
 
 def decode_mask(rle):
@@ -410,7 +432,6 @@ class TGSRDataset(data.Dataset):
                         except Exception as e:
                             print(f"解码掩码失败: {e}")
                             continue
-        
         # 返回必要的训练数据，避免复杂的数据结构
         return_d = {
             'gt': img_gt, 
@@ -420,6 +441,7 @@ class TGSRDataset(data.Dataset):
             'gt_path': img_gt_path,
             'text_prompt': text_prompt,
             'text_regions_mask': text_regions_mask,  # 包含所有文本相关区域的单一掩码
+            'objects_info_str': json.dumps(bytes_to_string_json_safe(objects_info))  # 先处理bytes再序列化
         }
         
         return return_d
@@ -435,4 +457,4 @@ def encode_mask(mask):
     rle = mask_util.encode(mask)
     if isinstance(rle['counts'], bytes):
         rle['counts'] = rle['counts'].decode('utf-8')
-    return rle 
+    return rle
