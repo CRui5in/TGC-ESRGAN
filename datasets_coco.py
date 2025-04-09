@@ -425,8 +425,8 @@ def create_tgsr_dataset(coco_dir, output_dir, jpeg_quality=90, resize_scale=None
 if __name__ == "__main__":
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='从COCO2017数据集创建文本引导超分辨率数据集')
-    parser.add_argument('--coco_dir', type=str, default='./COCO2017', help='COCO数据集根目录路径')
-    parser.add_argument('--output_dir', type=str, default='./tgsr_dataset_hr_only', help='输出数据集目录路径')
+    parser.add_argument('--coco_dir', type=str, default='/root/autodl-tmp/COCO2017', help='COCO数据集根目录路径')
+    parser.add_argument('--output_dir', type=str, default='/root/autodl-tmp/tgsr_dataset_hr_only', help='输出数据集目录路径')
     parser.add_argument('--jpeg_quality', type=int, default=100, help='JPEG压缩质量 (1-100)')
     parser.add_argument('--resize_scale', type=float, default=None, help='图像缩放比例 (可选，如0.5表示缩小到50%)')
     parser.add_argument('--max_workers', type=int, default=8, help='最大工作线程数')

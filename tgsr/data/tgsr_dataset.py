@@ -61,7 +61,7 @@ def apply_targeted_degradation(img, objects_info, text_prompt, degradation_level
 
 
 @DATASET_REGISTRY.register()
-class TGSRDataset_basicsr(data.Dataset):
+class TGSRDataset(data.Dataset):
     """Dataset used for Text-Guided Super-Resolution model.
     It extends RealESRGAN dataset to support text prompts.
 
@@ -80,7 +80,7 @@ class TGSRDataset_basicsr(data.Dataset):
     """
 
     def __init__(self, opt):
-        super(TGSRDataset_basicsr, self).__init__()
+        super(TGSRDataset, self).__init__()
         self.opt = opt
         self.file_client = None
         self.io_backend_opt = opt['io_backend']

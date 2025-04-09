@@ -34,6 +34,8 @@ jpeg_range2: [30, 95]
 gt_size: 256
 queue_size: 144  # 减小队列大小以减少内存使用
 
+accumulate_grad_batches: 4
+
 # 全局设置
 # use_text_features: true  # 是否使用文本特征 - 已移动到顶层
 
@@ -47,7 +49,7 @@ text_encoder:
 datasets:
   train:
     name: TGSR_train
-    type: TGSRDataset_basicsr
+    type: TGSRDataset
     dataroot_gt: /root/autodl-tmp/tgsr_dataset_hr_only/train/hr
     text_file: /root/autodl-tmp/tgsr_dataset_hr_only/train_captions.json
     io_backend:
@@ -90,21 +92,21 @@ datasets:
       quality_max_factor: 1.2  # 文本区域最大JPEG质量提升因子
       quality_max: 95          # 文本区域JPEG质量上限，避免超过100
 
-      gt_size: 256
-      use_hflip: True
-      use_rot: False
+    gt_size: 256
+    use_hflip: True
+    use_rot: False
 
     # data loader
     use_shuffle: true
-    num_worker_per_gpu: 2  # 减少工作线程以减轻CPU负担
-    batch_size_per_gpu: 1  # 减小批次大小减少内存峰值
+    num_worker_per_gpu: 3  
+    batch_size_per_gpu: 2  
     dataset_enlarge_ratio: 1
     prefetch_mode: cuda  # 使用CUDA进行预取
     pin_memory: true  # 启用pin_memory加速数据传输
 
   val:
     name: TGSR_val
-    type: TGSRDataset_basicsr
+    type: TGSRDataset
     dataroot_gt: /root/autodl-tmp/tgsr_dataset_hr_only/val/hr
     text_file: /root/autodl-tmp/tgsr_dataset_hr_only/val_captions.json
     io_backend:
@@ -209,10 +211,34 @@ train:
   net_d_iters: 1
   net_d_init_iters: 0
 
+  cri_semantic:
+    type: TextSemanticConsistencyLoss
+    loss_weight: 1.0
+    reduction: mean
+  
+  cri_attention:
+    type: TextRegionAttentionLoss
+    loss_weight: 0.5
+    reduction: mean
+  
+  cri_refinement:
+    type: FeatureRefinementLoss
+    loss_weight: 0.5
+    margin: 0.1
+    stability_weight: 0.05
+    reduction: mean
+
+  # 特征维度，用于特征投影
+  feat_dim: 64  # 根据RRDBNet的实际特征维度调整
+
 # validation settings
 val:
-  val_freq: !!float 5e3  # 减少验证频率，提高训练效率
+  val_freq: !!float 1e4  # 减少验证频率，提高训练效率
   save_img: True
+  save_attention_maps: true
+  compare_with_unguided: true
+  save_comparison: true
+  compare_metrics: true
   metrics:
     psnr: # metric name
       type: calculate_psnr

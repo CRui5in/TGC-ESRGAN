@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 设置CUDA设备
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0
 
 # 获取脚本所在目录的绝对路径
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
@@ -16,7 +16,7 @@ mkdir "$PROJECT_ROOT/tb_logger/"
 
 # 设置日志文件名（使用时间戳）
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="$PROJECT_ROOT/logs/train_log_${TIMESTAMP}.txt"
+LOG_FILE="$PROJECT_ROOT/logs/train_log_${TIMESTAMP}.log"
 
 # 配置文件路径
 CONFIG="$PROJECT_ROOT/options/train_tgsr_x4plus.yml"
