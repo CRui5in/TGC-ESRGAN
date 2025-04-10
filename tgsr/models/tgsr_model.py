@@ -1153,18 +1153,23 @@ class TGSRModel(SRGANModel):
                 with torch.no_grad():
                     self.output = self.forward_sr_network(self.lq, apply_guidance=True)
                     results['guided'] = self.output.clone()
-                
+            
+            # 设置回引导结果用于指标计算
+            self.output = results['guided']
+            
+            # 计算指标和保存图像
+            visuals = self.get_current_visuals()
+            sr_img = tensor2img([visuals['result']])
+            
             # 只保存前20张图片的结果
             save_this_img = save_img and idx < 20
                 
             # 保存注意力图（如果有）
-            if save_this_img and self.opt.get('val', {}).get('save_attention_maps', False) and hasattr(self, 'attention_maps') and self.attention_maps:
+            if save_this_img and self.opt.get('val', {}).get('save_attention_maps', False) and self.attention_maps:
                 attention_maps = self.get_current_attention_maps()
                 if attention_maps:
-                    for attn_name, attn_map in attention_maps.items():
-                        attn_colored = cv2.applyColorMap((attn_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
-                        save_path = osp.join(save_path_root, 'attention', f'{img_name}_{attn_name}_{current_iter}.png')
-                        cv2.imwrite(save_path, attn_colored)
+                    # 使用GradCAM风格保存合并后的注意力图
+                    self.save_gradcam_attention(sr_img, attention_maps, img_name, save_path_root, current_iter)
             
             # 2. 可选: 测试无文本引导的结果进行对比
             if self.opt.get('val', {}).get('compare_with_unguided', False):
@@ -1409,9 +1414,6 @@ class TGSRModel(SRGANModel):
                             l_t_attn = l_t_attn / self.accumulate_grad_batches  # 归一化
                             l_t_total += l_t_attn
                             loss_dict[f'l_t_attn_{pos}'] = l_t_attn
-                        else:
-                            # 记录有效样本数为0的情况
-                            self.logger.warning(f"位置{pos}的注意力损失没有有效样本")
             
             # 3. 特征细化损失
             if (hasattr(self, 'cri_refinement') and hasattr(self, 'original_features_cache') 
@@ -1528,3 +1530,113 @@ class TGSRModel(SRGANModel):
         self.save_network(self.net_d, 'net_d', current_iter)
         # 保存训练状态
         self.save_training_state(epoch, current_iter) 
+    
+    def save_gradcam_attention(self, img, attention_maps, img_name, save_path, iter_num):
+        """将所有注意力图以GradCAM风格叠加在原图上，并添加颜色图例
+        
+        Args:
+            img: 原始图像，BGR格式的numpy数组，shape (H, W, 3)
+            attention_maps: 注意力图字典，每个元素是一个shape为(H, W)的numpy数组
+            img_name: 图像名称，用于保存文件
+            save_path: 保存路径
+            iter_num: 当前迭代次数
+        """
+        if len(attention_maps) == 0:
+            return
+        
+        # 1. 合并所有注意力图（使用平均值）
+        all_maps = np.stack([attn for attn in attention_maps.values()])
+        combined_map = np.mean(all_maps, axis=0)
+        
+        # 确保尺寸匹配
+        combined_map = cv2.resize(combined_map, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
+        
+        # 2. 转换为热力图
+        heatmap = cv2.applyColorMap((combined_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        
+        # 3. 叠加到原图（透明度0.4）
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img.shape[2] == 3 else img.copy()
+        overlay = cv2.addWeighted(img_rgb, 0.6, heatmap, 0.4, 0)
+        
+        # 4. 添加颜色图例
+        h, w = overlay.shape[:2]
+        # 图例高度和宽度
+        legend_h, legend_w = 30, w
+        legend = np.zeros((legend_h, legend_w, 3), dtype=np.uint8)
+        
+        # 创建从蓝到红的渐变色条
+        for i in range(legend_w):
+            ratio = i / (legend_w - 1)
+            # 颜色映射 - 使用相同的JET色彩映射
+            if ratio < 0.25:  # 蓝到青
+                b = 255
+                g = int(255 * ratio * 4)
+                r = 0
+            elif ratio < 0.5:  # 青到绿
+                b = int(255 * (0.5 - ratio) * 4)
+                g = 255
+                r = 0
+            elif ratio < 0.75:  # 绿到黄
+                b = 0
+                g = 255
+                r = int(255 * (ratio - 0.5) * 4)
+            else:  # 黄到红
+                b = 0
+                g = int(255 * (1.0 - ratio) * 4)
+                r = 255
+                
+            legend[:, i] = [r, g, b]
+        
+        # 添加文字标签
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        cv2.putText(legend, 'Low', (5, 20), font, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(legend, 'High', (legend_w - 45, 20), font, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
+        
+        # 5. 将图例添加到叠加图像下方
+        result = np.vstack([overlay, legend])
+        
+        # 6. 添加文本描述（如果有）
+        if hasattr(self, 'text_prompts') and len(self.text_prompts) > 0:
+            text = self.text_prompts[0]
+            if text:
+                # 创建文本区域
+                text_h = 40
+                text_area = np.ones((text_h, w, 3), dtype=np.uint8) * 240  # 淡灰色背景
+                
+                # 将长文本分成多行
+                max_chars = w // 10  # 估计每个字符的宽度
+                if len(text) > max_chars:
+                    words = text.split()
+                    lines = []
+                    current_line = words[0]
+                    for word in words[1:]:
+                        if len(current_line) + len(word) + 1 <= max_chars:
+                            current_line += " " + word
+                        else:
+                            lines.append(current_line)
+                            current_line = word
+                    lines.append(current_line)
+                    
+                    # 如果有多行，调整文本区域的高度
+                    if len(lines) > 1:
+                        text_h = min(len(lines) * 20, 60)  # 限制最高60像素
+                        text_area = np.ones((text_h, w, 3), dtype=np.uint8) * 240
+                    
+                    # 添加每行文本
+                    for i, line in enumerate(lines):
+                        y_pos = 20 + i * 20
+                        if y_pos < text_h - 5:
+                            cv2.putText(text_area, line, (5, y_pos), font, font_scale, (0, 0, 0), 1, cv2.LINE_AA)
+                else:
+                    # 单行文本
+                    cv2.putText(text_area, text, (5, 20), font, font_scale, (0, 0, 0), 1, cv2.LINE_AA)
+                
+                # 添加文本区域到结果图像
+                result = np.vstack([text_area, result])
+        
+        # 7. 保存结果
+        save_path = osp.join(save_path, f'{img_name}_gradcam_{iter_num}.png')
+        cv2.imwrite(save_path, cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
+        
+        return save_path

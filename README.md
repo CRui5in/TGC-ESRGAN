@@ -1,120 +1,138 @@
 # TGSR: Text-Guided Super-Resolution
 
-TGSR是一个基于文本引导的超分辨率模型框架，基于BasicSR框架开发，参考了Real-ESRGAN的结构。通过融合文本条件信息，能够生成更符合文本描述的超分辨率图像。
+TGSR是一个基于文本引导的超分辨率模型框架，将文本描述信息融入超分辨率过程，生成更符合文本语义的高分辨率图像。TGSR基于Real-ESRGAN架构，结合CLIP文本编码器，添加了文本条件注意力模块。
 
-## 特性
+![TGSR架构](assets/tgsr_architecture.png)
 
-- 文本引导的超分辨率
-- 基于BasicSR的灵活训练框架
-- GradCAM注意力可视化
-- TensorBoard实时监控
-- 支持多GPU训练(DP/DDP)
-- 支持断点续训
+## 主要特性
+
+- **文本语义引导**: 利用文本信息指导超分辨率过程，注重描述中提及的区域
+- **多层级特征增强**: 在浅层、中层和深层特征上应用文本引导，实现全面的语义对齐
+- **区域感知注意力**: 智能识别图像中与文本相关的区域，有针对性地增强细节
+- **三重语义一致性损失**: 
+  - 语义一致性损失(l_t_semantic)
+  - 注意力区域监督损失(l_t_attn)
+  - 特征细化损失(l_t_refine)
+- **灵活的训练框架**: 基于BasicSR开发，支持多GPU训练和断点续训
+
+## 实验环境
+
+- Python 3.10
+- PyTorch 2.1.0
+- CUDA 11.8
+- 2080TI 11G * 2
 
 ## 安装
 
-### 依赖
-
-- Python >= 3.7
-- PyTorch >= 1.7
-- BasicSR >= 1.4.0
-- CLIP (OpenAI)
-
-### 安装步骤
+### 通过pip安装
 
 ```bash
 # 克隆仓库
 git clone https://github.com/CRui5in/TGSR.git
 cd TGSR
 
+# 创建虚拟环境(可选但推荐)
+conda create -n tgsr python=3.10
+conda activate tgsr
+
 # 安装依赖
 pip install -r requirements.txt
-pip install -e .
 ```
 
-## 数据准备
+TGSR需要配对的低/高分辨率图像和对应的文本描述。支持两种格式的数据集:
 
-TGSR需要成对的低分辨率/高分辨率图像以及对应的文本描述。文本描述需要以下格式保存在文本文件中：
+### 1. COCO格式数据集
+
+```json
+[
+  {
+    "hr_path": "train/hr/image1.jpg",
+    "caption": "一只橙色的猫坐在树上",
+    "objects": [
+      {
+        "category": "cat",
+        "bbox": [120, 30, 80, 120],
+        "mask_encoded": { ... }
+      }
+    ]
+  }
+]
+```
+
+### 2. 简单文本-图像对
 
 ```
-image1.png    高分辨率的猫图像
-image2.png    清晰的自然风景
+image1.jpg    一只橙色的猫坐在树上
+image2.jpg    绿色草地上的红色花朵
 ```
 
-## 使用方法
+## 预训练模型
 
-### 训练
-
-使用以下命令启动训练：
+TGSR需要预训练的CLIP模型和ESRGAN模型:
 
 ```bash
-# 使用默认配置文件训练
-sh scripts/start_training.sh
+# 下载预训练的模型
+mkdir -p pretrained_models
+wget -O pretrained_models/clip-vit-base-patch32.pth https://openaipublic.azureedge.net/clip/models/40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af/ViT-B-32.pt
+wget -O pretrained_models/RealESRNet_x4plus.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRNet_x4plus.pth
+```
 
-# 指定配置文件训练
-sh scripts/start_training.sh --opt options/my_config.yml
+## 训练
 
-# 使用特定数量的GPU
-sh scripts/start_training.sh --gpu 2
+### 单GPU训练
 
-# 启用内存优化
-sh scripts/start_training.sh --memory_opt
+```bash
+./tgsr/start_train.sh
+```
+
+### 多GPU训练
+
+```bash
+# 使用4个GPU训练
+./tgsr/start_train.sh
 ```
 
 ### 恢复训练
 
-从检查点恢复训练：
-
 ```bash
-sh scripts/resume_train.sh --checkpoint experiments/train_TGSR_x4/models/50000_G.pth
+python tgsr/train.py -opt options/train_tgsr_x4plus.yml --auto_resume
 ```
 
-### 停止训练
+## 推理
+
+### 单张图像处理
 
 ```bash
-sh scripts/stop_train.sh
+python tgsr/inference.py --input samples/cat.jpg --text "一只橙色的猫坐在树上" --model_path experiments/pretrained_models/TGSR_x4plus.pth --output results/
 ```
 
-### 清理日志
+### 批量处理
 
 ```bash
-sh scripts/clean_logs.sh
+python tgsr/inference.py --input samples/ --text_file samples/captions.txt --model_path experiments/pretrained_models/TGSR_x4plus.pth --output results/
 ```
 
-## 可视化
-
-训练过程中会自动启动TensorBoard，可以通过访问 http://localhost:6006 查看训练进度、损失曲线和生成的图像。可视化内容包括：
-
-- 训练/验证损失
-- 生成的SR图像与GT对比
-- 注意力热力图
-- PSNR/SSIM等评估指标
-
-## 配置文件说明
-
-配置文件位于`options/`目录，主要包括以下几个部分：
-
-- 数据集配置
-- 网络配置
-- 训练参数
-- 验证参数
-- 文本编码器配置
-
-详细配置请参考`options/train_tgsr_x4.yml`中的注释。
 
 ## 引用
 
-如果您使用了TGSR框架，请引用以下项目：
+如果您在研究中使用了TGSR，请引用我们的工作:
 
 ```
-@InProceedings{wang2021realesrgan,
-    author    = {Xintao Wang and Liangbin Xie and Chao Dong and Ying Shan},
-    title     = {Real-ESRGAN: Training Real-World Blind Super-Resolution with Pure Synthetic Data},
-    booktitle = {International Conference on Computer Vision Workshops (ICCVW)},
-    date      = {2021}
-}
+
 ```
 
 ## 许可证
 
-本项目遵循MIT许可证 
+本项目采用MIT许可证
+
+## 致谢
+
+TGSR基于以下开源项目:
+
+- [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)
+- [BasicSR](https://github.com/XPixelGroup/BasicSR)
+- [CLIP](https://github.com/openai/CLIP)
+
+## 联系方式
+
+- GitHub: [CRui5in](https://github.com/CRui5in) 
