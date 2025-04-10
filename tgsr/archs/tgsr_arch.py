@@ -308,12 +308,12 @@ class RegionAwareTextFusion(nn.Module):
         self.channels = channels
         self.text_dim = text_dim
         
-        # 生成区域注意力权重
+        # 生成区域注意力权重 - 移除最后的Sigmoid层，输出为logits
         self.attention_gen = nn.Sequential(
             nn.Conv2d(channels + text_dim, channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels, 1, kernel_size=1),
-            nn.Sigmoid()
+            nn.Conv2d(channels, 1, kernel_size=1)
+            # 移除Sigmoid层，让输出保持为logits形式，配合BCEWithLogitsLoss使用
         )
         
         # 生成文本调制特征
@@ -329,16 +329,19 @@ class RegionAwareTextFusion(nn.Module):
         b, c, h, w = features.shape
         text_feat_expanded = text_embedding.unsqueeze(2).unsqueeze(3).expand(-1, -1, h, w)
         combined_feat = torch.cat([features, text_feat_expanded], dim=1)
-        attention_map = self.attention_gen(combined_feat)  # [B, 1, H, W]
+        attention_logits = self.attention_gen(combined_feat)  # [B, 1, H, W] - 现在是logits
+        
+        # 在前向传播时应用sigmoid，以便于可视化和其他用途
+        attention_map = torch.sigmoid(attention_logits)
         
         # 文本特征调制
         text_feat_mod = self.text_modulation(text_embedding)  # [B, C]
         text_feat_mod = text_feat_mod.unsqueeze(2).unsqueeze(3)  # [B, C, 1, 1]
         
-        # 应用区域感知的文本融合
+        # 应用区域感知的文本融合 - 使用sigmoid后的attention_map
         enhanced_features = features + features * attention_map * text_feat_mod
         
-        return enhanced_features, attention_map
+        return enhanced_features, attention_logits  # 返回logits用于损失计算
 
 
 class TextAttentionBlock(nn.Module):
@@ -382,7 +385,7 @@ class TextAttentionBlock(nn.Module):
             features = features + pos_encoding
             
             # 区域感知文本融合
-            enhanced_features, attention_map = self.text_fusion(features, text_pooled)
+            enhanced_features, attention_logits = self.text_fusion(features, text_pooled)
             
             # 将特征展平为序列形式，用于交叉注意力
             b, c, h, w = enhanced_features.shape
@@ -407,7 +410,7 @@ class TextAttentionBlock(nn.Module):
             # 残差连接
             output_features = features + normalized_features
             
-            return output_features, attention_map
+            return output_features, attention_logits
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -475,7 +478,7 @@ class TextGuidanceNet(nn.Module):
         
         # 应用文本注意力模块
         for i, block in enumerate(self.text_blocks):
-            enhanced_features, attn_map = block(enhanced_features, text_hidden, text_pooled)
-            attention_maps.append(attn_map)
+            enhanced_features, attn_logits = block(enhanced_features, text_hidden, text_pooled)
+            attention_maps.append(attn_logits)
         
         return enhanced_features, attention_maps 

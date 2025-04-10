@@ -36,9 +36,6 @@ queue_size: 144  # 减小队列大小以减少内存使用
 
 accumulate_grad_batches: 4
 
-# 全局设置
-# use_text_features: true  # 是否使用文本特征 - 已移动到顶层
-
 # -------------- CLIP text encoder settings -------------- #
 text_encoder:
   name: /root/autodl-tmp/clip-vit-base-patch32
@@ -98,7 +95,7 @@ datasets:
 
     # data loader
     use_shuffle: true
-    num_worker_per_gpu: 3  
+    num_worker_per_gpu: 4  
     batch_size_per_gpu: 2  
     dataset_enlarge_ratio: 1
     prefetch_mode: cuda  # 使用CUDA进行预取
@@ -252,7 +249,7 @@ val:
 # logging settings
 logger:
   print_freq: 100
-  save_checkpoint_freq: !!float 5e3
+  save_checkpoint_freq: !!float 1e4
   use_tb_logger: true
   wandb:
     project: ~

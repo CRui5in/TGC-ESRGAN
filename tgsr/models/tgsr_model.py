@@ -78,9 +78,11 @@ class TGSRModel(SRGANModel):
 
     def __init__(self, opt):
         self.use_text_features = True
-        
-        # 调用基类初始化
         super(TGSRModel, self).__init__(opt)
+        
+        # 初始化日志记录器
+        self.logger = get_root_logger()
+        
         self.jpeger = DiffJPEG(differentiable=False).cuda()  # 模拟JPEG压缩
         self.usm_sharpener = USMSharp().cuda()  # USM锐化
         self.queue_size = opt.get('queue_size', 180)
@@ -906,17 +908,17 @@ class TGSRModel(SRGANModel):
         
         # 应用文本引导
         if position_info is not None:
-            enhanced_features, attention_maps = self.net_t(features, text_hidden, text_pooled, position_info)
+            enhanced_features, attention_logits = self.net_t(features, text_hidden, text_pooled, position_info)
         else:
-            enhanced_features, attention_maps = self.net_t(features, text_hidden, text_pooled)
+            enhanced_features, attention_logits = self.net_t(features, text_hidden, text_pooled)
         
         # 存储块位置信息和注意力图，供损失函数使用
-        if self.is_train and attention_maps is not None:
+        if self.is_train and attention_logits is not None:
             if not hasattr(self, 'current_attention_maps') or self.current_attention_maps is None:
                 self.current_attention_maps = {}
-            self.current_attention_maps[block_idx] = attention_maps
+            self.current_attention_maps[block_idx] = attention_logits
         
-        return enhanced_features, attention_maps
+        return enhanced_features, attention_logits
     
     def forward_sr_network(self, x, apply_guidance=True):
         """SR网络的前向传播，在关键位置应用文本引导
@@ -1058,9 +1060,13 @@ class TGSRModel(SRGANModel):
                     # 保存注意力图
                     if attn_maps is not None and (not self.is_train or getattr(self, 'save_attention', False)):
                         if isinstance(attn_maps, list):
-                            attention_maps.extend(attn_maps)
+                            # 注意力logits现在需要应用sigmoid才能用于可视化
+                            processed_attn_maps = [torch.sigmoid(logits) for logits in attn_maps if logits is not None]
+                            attention_maps.extend(processed_attn_maps)
                         else:
-                            attention_maps.append(attn_maps)
+                            # 单个注意力图也需要应用sigmoid
+                            processed_attn = torch.sigmoid(attn_maps)
+                            attention_maps.append(processed_attn)
         else:
             # 不使用文本引导
             for block in self.net_g.RRDB_trunk:
@@ -1370,11 +1376,11 @@ class TGSRModel(SRGANModel):
                 # 对每个位置的注意力图应用损失
                 for pos, attn_maps in self.current_attention_maps.items():
                     if isinstance(attn_maps, list) and len(attn_maps) > 0:
-                        # 使用最后一个注意力图（通常最精细）
-                        attn_map = attn_maps[-1]
+                        # 使用最后一个注意力图（通常最精细）- 现在是logits形式
+                        attn_logits = attn_maps[-1]
                         
                         # 使用逐样本处理方式处理objects_info
-                        batch_size = attn_map.size(0)
+                        batch_size = attn_logits.size(0)
                         l_t_attn_batch = 0
                         valid_samples = 0
                         
@@ -1382,17 +1388,19 @@ class TGSRModel(SRGANModel):
                             # 获取当前样本的文本提示和对象信息
                             sample_text = [self.text_prompts[i]]
                             sample_objects = [objects_info[i]] if i < len(objects_info) else [[]]
-                            sample_attn_map = attn_map[i:i+1]
+                            sample_attn_logits = attn_logits[i:i+1]
                             
-                            # 对单个样本进行处理
+                            # 对单个样本进行处理 - 传入logits而非sigmoid后的结果
                             try:
-                                sample_loss = self.cri_attention(sample_attn_map, sample_text, sample_objects, self.device)
+                                # 注意：cri_attention现在接收logits
+                                sample_loss = self.cri_attention(sample_attn_logits, sample_text, sample_objects, self.device)
                                 
                                 # 只有当样本损失有效时才累加
                                 if sample_loss.item() > 0:
                                     l_t_attn_batch += sample_loss
                                     valid_samples += 1
-                            except Exception:
+                            except Exception as e:
+                                self.logger.warning(f"注意力损失计算失败: {e}")
                                 continue
                         
                         # 计算批次平均损失
@@ -1401,6 +1409,9 @@ class TGSRModel(SRGANModel):
                             l_t_attn = l_t_attn / self.accumulate_grad_batches  # 归一化
                             l_t_total += l_t_attn
                             loss_dict[f'l_t_attn_{pos}'] = l_t_attn
+                        else:
+                            # 记录有效样本数为0的情况
+                            self.logger.warning(f"位置{pos}的注意力损失没有有效样本")
             
             # 3. 特征细化损失
             if (hasattr(self, 'cri_refinement') and hasattr(self, 'original_features_cache') 
@@ -1485,9 +1496,9 @@ class TGSRModel(SRGANModel):
             return None
         
         attention_dict = {}
-        for i, attn_map in enumerate(self.attention_maps):
-            # 提取第一个样本的注意力图
-            attention_2d = attn_map[0, 0].cpu().detach()
+        for i, attn_logits in enumerate(self.attention_maps):
+            # 提取第一个样本的注意力图并应用sigmoid将logits转换为概率
+            attention_2d = torch.sigmoid(attn_logits[0, 0]).cpu().detach()
             
             # 归一化
             min_val = attention_2d.min()
