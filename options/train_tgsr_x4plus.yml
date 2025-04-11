@@ -72,22 +72,22 @@ datasets:
 
     
     # ----------------- 文本区域特定退化参数 ----------------- #
-    use_targeted_degradation: true
-    # 模糊参数 - 文本区域使用较轻的模糊效果
-    text_blur:
-      kernel_size: 11       # 文本区域模糊核大小，较小的核尺寸产生更轻微的模糊
-      center_weight: 0.7    # 中心点权重，原值3.0导致图像过亮，现降至0.7保持轻度模糊效果
-      surround_weight: 0.003 # 周围点权重，调整为使卷积核总和约为1.0 (0.7 + 120*0.0025 ≈ 1.0)
+    # use_targeted_degradation: true
+    # # 模糊参数 - 文本区域使用较轻的模糊效果
+    # text_blur:
+    #   kernel_size: 11       # 文本区域模糊核大小，较小的核尺寸产生更轻微的模糊
+    #   center_weight: 0.7    # 中心点权重，原值3.0导致图像过亮，现降至0.7保持轻度模糊效果
+    #   surround_weight: 0.003 # 周围点权重，调整为使卷积核总和约为1.0 (0.7 + 120*0.0025 ≈ 1.0)
 
-    # 噪声参数 - 文本区域使用较轻的噪声
-    text_noise:
-      strength_factor: 0.5  # 文本区域噪声强度因子，相对于非文本区域（值越小噪声越轻）
+    # # 噪声参数 - 文本区域使用较轻的噪声
+    # text_noise:
+    #   strength_factor: 0.5  # 文本区域噪声强度因子，相对于非文本区域（值越小噪声越轻）
 
-    # JPEG压缩参数 - 文本区域使用较高的质量
-    text_jpeg:
-      quality_min_factor: 2.5  # 文本区域最小JPEG质量提升因子（值越大质量越高）
-      quality_max_factor: 1.2  # 文本区域最大JPEG质量提升因子
-      quality_max: 95          # 文本区域JPEG质量上限，避免超过100
+    # # JPEG压缩参数 - 文本区域使用较高的质量
+    # text_jpeg:
+    #   quality_min_factor: 2.5  # 文本区域最小JPEG质量提升因子（值越大质量越高）
+    #   quality_max_factor: 1.2  # 文本区域最大JPEG质量提升因子
+    #   quality_max: 95          # 文本区域JPEG质量上限，避免超过100
 
     gt_size: 256
     use_hflip: True
@@ -210,12 +210,12 @@ train:
 
   cri_semantic:
     type: TextSemanticConsistencyLoss
-    loss_weight: 1.0
+    loss_weight: 0.5
     reduction: mean
   
   cri_attention:
     type: TextRegionAttentionLoss
-    loss_weight: 0.5
+    loss_weight: 1.0
     reduction: mean
   
   cri_refinement:
@@ -230,8 +230,8 @@ train:
 
 # validation settings
 val:
-  val_freq: !!float 1e4  # 减少验证频率，提高训练效率
-  save_img: True
+  val_freq: !!float 4e4  # 减少验证频率，提高训练效率
+  save_img: true
   save_attention_maps: true
   compare_with_unguided: true
   save_comparison: true

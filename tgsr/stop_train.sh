@@ -4,16 +4,25 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-# 找到并终止训练进程
+# 从PID文件中读取训练进程PID
+PID_FILE="$SCRIPT_DIR/train_pid.txt"
 echo "正在停止训练进程..."
-TRAIN_PID=$(ps -ef | grep "[p]ython -u train.py" | awk '{print $2}')
 
-if [ -n "$TRAIN_PID" ]; then
-    echo "找到训练进程 PID: $TRAIN_PID，正在终止..."
-    kill -9 $TRAIN_PID
-    echo "训练进程已终止"
+if [ -f "$PID_FILE" ]; then
+    TRAIN_PID=$(cat "$PID_FILE")
+    if [ -n "$TRAIN_PID" ] && ps -p $TRAIN_PID > /dev/null; then
+        echo "找到训练进程 PID: $TRAIN_PID，正在终止..."
+        kill -9 $TRAIN_PID
+        echo "训练进程已终止"
+        # 删除PID文件
+        rm "$PID_FILE"
+        echo "已删除PID文件: $PID_FILE"
+    else
+        echo "PID文件中的进程($TRAIN_PID)不存在或已终止"
+        rm -f "$PID_FILE"
+    fi
 else
-    echo "未找到训练进程"
+    echo "PID文件不存在: $PID_FILE"
 fi
 
 # 清除实验结果

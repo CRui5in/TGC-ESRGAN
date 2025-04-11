@@ -46,59 +46,32 @@ def decode_mask(rle):
     return mask
 
 
-def apply_targeted_degradation(img, objects_info, text_prompt, degradation_level=0.0):
-    """
-    对图像应用有针对性的退化，直接使用所有objects标注区域进行轻度退化
-    
-    参数:
-    - img: 输入图像 [H, W, C]
-    - objects_info: 对象信息列表，包含掩码和类别
-    - text_prompt: 文本描述 (不再使用匹配)
-    - degradation_level: 现在仅用作占位符参数，实际上使用二值掩码 (0表示文本区域，1表示其他区域)
-    
-    返回:
-    - degradation_mask: 退化区域掩码 [H, W]，二值掩码
-      值为0的区域表示文本区域，将获得轻度退化处理
-      值为1的区域表示其他区域，将获得标准退化处理
-    """
-    h, w = img.shape[0], img.shape[1]
-    
-    # 初始化退化掩码，默认为1.0（标准退化）
-    degradation_mask = np.ones((h, w), dtype=np.float32)
-    
-    # 遍历所有对象 - 不再检查文本匹配
-    for obj in objects_info:
-        # 解码对象掩码
-        if 'mask_encoded' in obj:
-            try:
-                obj_mask = decode_mask(obj['mask_encoded'])
-                # 在掩码区域应用较轻的退化 - 将退化掩码值设为0.0（表示文本区域）
-                degradation_mask[obj_mask > 0] = 0.0
-                category = obj.get('category', 'unknown')
-            except Exception as e:
-                print(f"解码掩码失败: {e}")
-                continue
-    
-    return degradation_mask
+def encode_mask(mask):
+    """将二维掩码编码为Run-Length编码格式"""
+    # 使用pycocotools的RLE编码
+    mask = np.asfortranarray(mask.astype(np.uint8))
+    rle = mask_util.encode(mask)
+    if isinstance(rle['counts'], bytes):
+        rle['counts'] = rle['counts'].decode('utf-8')
+    return rle
 
 
 @DATASET_REGISTRY.register()
 class TGSRDataset(data.Dataset):
-    """Dataset used for Text-Guided Super-Resolution model.
-    It extends RealESRGAN dataset to support text prompts.
-
-    It loads gt (Ground-Truth) images, and augments them.
-    It also generates blur kernels and sinc kernels for generating low-quality images.
-    Note that the low-quality images are processed in tensors on GPUS for faster processing.
+    """Dataset用于文本引导的超分辨率模型。
+    
+    它继承RealESRGAN数据集并支持文本提示。
+    它加载GT图像并增强它们，同时生成用于低质量图像生成的模糊核和sinc核。
+    低质量图像在GPU上以张量形式处理以实现更快的处理。
 
     Args:
-        opt (dict): Config for train datasets. It contains the following keys:
-            dataroot_gt (str): Data root path for gt.
-            text_file (str): Path for text prompts file.
-            io_backend (dict): IO backend type and other kwarg.
-            use_hflip (bool): Use horizontal flips.
-            use_rot (bool): Use rotation (use vertical flip and transposing h and w for implementation).
-            Please see more options in the codes.
+        opt (dict): 训练数据集的配置。它包含以下键：
+            dataroot_gt (str): gt的数据根路径。
+            text_file (str): 文本提示文件的路径。
+            io_backend (dict): IO后端类型和其他kwarg。
+            use_hflip (bool): 使用水平翻转。
+            use_rot (bool): 使用旋转（使用垂直翻转和转置h和w进行实现）。
+            请参阅代码中的更多选项。
     """
 
     def __init__(self, opt):
@@ -122,7 +95,7 @@ class TGSRDataset(data.Dataset):
                     if isinstance(first_item['objects'], list) and len(first_item['objects']) > 0:
                         if isinstance(first_item['objects'][0], dict) and 'mask_encoded' in first_item['objects'][0]:
                             self.has_object_info = True
-                            self.logger.info("检测到包含对象掩码信息的数据集，将启用有针对性的退化")
+                            self.logger.info("检测到包含对象掩码信息的数据集")
             
             self.logger.info(f"加载了 {len(self.captions)} 个文本描述和对象信息")
         except Exception as e:
@@ -153,9 +126,6 @@ class TGSRDataset(data.Dataset):
         self.use_hflip = opt.get('use_hflip', True)
         self.use_rot = opt.get('use_rot', False)  # 不推荐使用旋转，会影响文本与图像的一致性
         self.gt_size = opt.get('gt_size', 256)
-        
-        # 有针对性退化的设置 - 不再使用text_region_factor，而是直接用二值掩码
-        self.use_targeted_degradation = opt.get('use_targeted_degradation', True) and self.has_object_info
         
         # file client (io backend)
         if 'io_backend' in self.opt and self.io_backend_opt['type'] == 'lmdb':
@@ -280,75 +250,24 @@ class TGSRDataset(data.Dataset):
         if retry == 0:
             raise Exception(f"加载图像失败，已重试3次: {img_gt_path}")
             
-        # 图像处理 - 使用水平翻转但避免随机裁剪
-        # 水平翻转不会影响文本与图像内容的一致性
-        if self.use_hflip and random.random() < 0.5:
-            img_gt = cv2.flip(img_gt, 1)  # 水平翻转
-            
-            # 如果水平翻转了图像，也需要翻转对象掩码
-            if self.has_object_info and objects_info:
-                # 获取图像宽度
-                img_width = img_gt.shape[1]
-                
-                # 翻转每个对象的边界框和掩码
-                for obj in objects_info:
-                    if 'bbox' in obj:
-                        # 边界框格式: [x, y, width, height]
-                        x, y, w, h = obj['bbox']
-                        # 翻转x坐标
-                        obj['bbox'][0] = img_width - x - w
-                    
-                    # 翻转掩码（如果有）
-                    if 'mask_encoded' in obj:
-                        try:
-                            mask = decode_mask(obj['mask_encoded'])
-                            # 翻转掩码
-                            flipped_mask = np.fliplr(mask)
-                            # 重新编码
-                            obj['mask_encoded'] = encode_mask(flipped_mask)
-                        except Exception as e:
-                            print(f"翻转掩码失败: {e}")
-        
-        # 处理图像尺寸 - 直接调整到固定尺寸以确保批处理兼容性
-        target_size = self.gt_size
-        h, w = img_gt.shape[:2]
-        
-        # 直接调整到目标尺寸，不保持长宽比
-        img_gt = cv2.resize(img_gt, (target_size, target_size), interpolation=cv2.INTER_LANCZOS4)
-        
-        # 更新对象掩码和边界框的尺寸
-        if self.has_object_info and objects_info:
-            scale_h = target_size / h
-            scale_w = target_size / w
-            for obj in objects_info:
-                if 'bbox' in obj:
-                    # 根据缩放比例调整边界框
-                    obj['bbox'][0] = int(obj['bbox'][0] * scale_w)
-                    obj['bbox'][1] = int(obj['bbox'][1] * scale_h)
-                    obj['bbox'][2] = int(obj['bbox'][2] * scale_w)
-                    obj['bbox'][3] = int(obj['bbox'][3] * scale_h)
-                
-                # 更新掩码尺寸
-                if 'mask_encoded' in obj:
-                    try:
-                        mask = decode_mask(obj['mask_encoded'])
-                        resized_mask = cv2.resize(mask, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
-                        obj['mask_encoded'] = encode_mask(resized_mask)
-                    except Exception as e:
-                        print(f"调整掩码尺寸失败: {e}")
+        # 图像增强处理 - 使用与RealESRGAN相同的方法
+        img_gt = augment(img_gt, self.use_hflip, self.use_rot)
 
-        # 创建有针对性的退化掩码 (对文本提及的对象区域应用较轻的退化)
-        degradation_mask = None
-        if self.use_targeted_degradation and self.has_object_info:
-            # 调用apply_targeted_degradation函数，为文本中提到的对象创建轻度退化掩码
-            degradation_mask = apply_targeted_degradation(
-                img_gt, objects_info, text_prompt, 0.0
-            )
-            
-        # 即使没有对象或没有启用有针对性退化，也创建一个标准掩码（所有值为1.0）
-        if degradation_mask is None:
-            h, w = img_gt.shape[0], img_gt.shape[1]
-            degradation_mask = np.ones((h, w), dtype=np.float32)
+        # 裁剪或填充到指定尺寸
+        h, w = img_gt.shape[0:2]
+        crop_pad_size = self.gt_size
+        # 填充
+        if h < crop_pad_size or w < crop_pad_size:
+            pad_h = max(0, crop_pad_size - h)
+            pad_w = max(0, crop_pad_size - w)
+            img_gt = cv2.copyMakeBorder(img_gt, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT_101)
+        # 裁剪
+        if img_gt.shape[0] > crop_pad_size or img_gt.shape[1] > crop_pad_size:
+            h, w = img_gt.shape[0:2]
+            # 随机选择顶部和左侧坐标
+            top = random.randint(0, h - crop_pad_size)
+            left = random.randint(0, w - crop_pad_size)
+            img_gt = img_gt[top:top + crop_pad_size, left:left + crop_pad_size, ...]
                 
         # ------------------------ Generate kernels (used in the first degradation) ------------------------ #
         kernel_size = random.choice(self.kernel_range)
@@ -410,29 +329,7 @@ class TGSRDataset(data.Dataset):
         kernel = torch.FloatTensor(kernel)
         kernel2 = torch.FloatTensor(kernel2)
         
-        # 转换退化掩码为张量（如果有）
-        if degradation_mask is not None:
-            degradation_mask = torch.FloatTensor(degradation_mask).unsqueeze(0)  # [1, H, W]
-            
-        # 简化返回数据，只保留必要的信息
-        # 创建综合掩码 - 将所有文本相关区域合并为一个掩码
-        h, w = self.gt_size, self.gt_size
-        text_regions_mask = torch.ones((1, h, w), dtype=torch.float32)  # 默认值为1（标准退化）
-        
-        if self.has_object_info and objects_info and text_prompt:
-            # 只有在有对象信息、对象列表非空且有文本描述时才处理
-            text_lower = text_prompt.lower()
-            for obj in objects_info:
-                if 'category' in obj and obj['category'].lower() in text_lower:
-                    if 'mask_encoded' in obj:
-                        try:
-                            obj_mask = decode_mask(obj['mask_encoded'])
-                            # 对文本提及的对象区域设置为0.0（表示文本区域，将获得轻度退化）
-                            text_regions_mask[0][obj_mask > 0] = 0.0
-                        except Exception as e:
-                            print(f"解码掩码失败: {e}")
-                            continue
-        # 返回必要的训练数据，避免复杂的数据结构
+        # 返回必要的训练数据
         return_d = {
             'gt': img_gt, 
             'kernel1': kernel, 
@@ -440,7 +337,6 @@ class TGSRDataset(data.Dataset):
             'sinc_kernel': sinc_kernel, 
             'gt_path': img_gt_path,
             'text_prompt': text_prompt,
-            'text_regions_mask': text_regions_mask,  # 包含所有文本相关区域的单一掩码
             'objects_info_str': json.dumps(bytes_to_string_json_safe(objects_info))  # 先处理bytes再序列化
         }
         
@@ -448,13 +344,3 @@ class TGSRDataset(data.Dataset):
 
     def __len__(self):
         return len(self.paths)
-        
-        
-def encode_mask(mask):
-    """将二维掩码编码为Run-Length编码格式"""
-    # 使用pycocotools的RLE编码
-    mask = np.asfortranarray(mask.astype(np.uint8))
-    rle = mask_util.encode(mask)
-    if isinstance(rle['counts'], bytes):
-        rle['counts'] = rle['counts'].decode('utf-8')
-    return rle

@@ -82,11 +82,17 @@ class TextRegionAttentionLoss(nn.Module):
     """
     文本区域监督注意力损失：指导注意力集中在与文本相关的对象区域
     """
-    def __init__(self, loss_weight=1.0, reduction='mean'):
+    def __init__(self, loss_weight=1.0, reduction='mean', entropy_weight=0.05, diversity_weight=0.02):
         super(TextRegionAttentionLoss, self).__init__()
         self.loss_weight = loss_weight
         self.reduction = reduction
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
+        
+        # 新增：注意力熵正则化权重 - 防止注意力崩塌
+        self.entropy_weight = entropy_weight
+        
+        # 新增：注意力多样性权重 - 鼓励不同文本产生不同的注意力
+        self.diversity_weight = diversity_weight
         
         # 类别同义词映射表，扩展匹配范围
         self.category_synonyms = {
@@ -248,6 +254,72 @@ class TextRegionAttentionLoss(nn.Module):
             
         return F.interpolate(mask, size=target_size, mode='nearest')
         
+    def entropy_regularization(self, attention_map):
+        """
+        计算注意力图的熵，鼓励注意力分布更均匀
+        
+        Args:
+            attention_map: 注意力图，形状为 [B, 1, H, W]
+            
+        Returns:
+            entropy_loss: 熵损失，值越低表示熵越高
+        """
+        # 应用sigmoid获取概率分布
+        attention_prob = torch.sigmoid(attention_map)
+        
+        # 确保数值稳定性
+        eps = 1e-7
+        attention_prob = attention_prob.clamp(min=eps, max=1.0-eps)
+        
+        # 计算熵：-p*log(p) - (1-p)*log(1-p)
+        entropy = -attention_prob * torch.log(attention_prob) - (1-attention_prob) * torch.log(1-attention_prob)
+        
+        # 取平均，取负使其成为最小化目标（熵越高越好）
+        entropy_loss = -entropy.mean()
+        
+        return entropy_loss
+    
+    def diversity_regularization(self, attention_maps, text_prompts):
+        """
+        鼓励不同文本生成不同的注意力图
+        
+        Args:
+            attention_maps: 批次中的注意力图 [B, 1, H, W]
+            text_prompts: 文本提示列表
+            
+        Returns:
+            diversity_loss: 多样性损失
+        """
+        batch_size = attention_maps.size(0)
+        if batch_size <= 1:
+            return torch.tensor(0.0, device=attention_maps.device)
+        
+        # 应用sigmoid获取概率分布
+        attention_probs = torch.sigmoid(attention_maps)
+        
+        # 计算批次内所有注意力图对之间的相似度
+        similarities = []
+        for i in range(batch_size):
+            for j in range(i+1, batch_size):
+                # 只在文本不同时计算相似度
+                if text_prompts[i] != text_prompts[j]:
+                    # 扁平化注意力图
+                    attn_i = attention_probs[i].view(-1)
+                    attn_j = attention_probs[j].view(-1)
+                    
+                    # 计算余弦相似度
+                    sim = F.cosine_similarity(attn_i.unsqueeze(0), attn_j.unsqueeze(0), dim=1)
+                    similarities.append(sim)
+        
+        # 如果没有不同的文本对，返回零损失
+        if not similarities:
+            return torch.tensor(0.0, device=attention_maps.device)
+        
+        # 计算平均相似度，我们希望相似度越低越好
+        avg_similarity = torch.stack(similarities).mean()
+        
+        return avg_similarity  # 直接返回相似度作为损失
+        
     def forward(self, attention_maps, text_prompts, objects_info, device=None):
         """
         Args:
@@ -260,6 +332,12 @@ class TextRegionAttentionLoss(nn.Module):
         device = attention_maps.device if device is None else device
         loss = torch.tensor(0.0, device=device)
         valid_samples = 0
+        
+        # 新增：计算熵正则化损失
+        entropy_loss = self.entropy_regularization(attention_maps)
+        
+        # 新增：计算多样性正则化损失
+        diversity_loss = self.diversity_regularization(attention_maps, text_prompts)
         
         for i in range(batch_size):
             # 获取当前样本的文本和对象信息
@@ -310,7 +388,10 @@ class TextRegionAttentionLoss(nn.Module):
         if valid_samples > 0:
             loss = loss / valid_samples
             
-        return self.loss_weight * loss
+        # 添加熵正则化和多样性正则化
+        final_loss = loss + self.entropy_weight * entropy_loss + self.diversity_weight * diversity_loss
+        
+        return self.loss_weight * final_loss
 
 
 @LOSS_REGISTRY.register()

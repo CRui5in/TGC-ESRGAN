@@ -22,52 +22,6 @@ from transformers import CLIPTokenizer, CLIPTextModel
 from basicsr.losses import build_loss
 import torch.nn as nn
 
-def safe_filter2D(img, kernel):
-    """一个安全的filter2D版本，处理任意尺寸的内核"""
-    # 确保kernel是2D形式 [k,k]
-    if kernel.dim() > 2:
-        # 如果是多维的，只保留最后两维
-        kernel = kernel.reshape(-1, *kernel.shape[-2:])[-1]  # 取最后一个kernel
-    
-    # 确保kernel是2D
-    assert kernel.dim() == 2, f"处理后的kernel应该是2D，但得到的是{kernel.dim()}D"
-    
-    # 获取尺寸
-    k = kernel.size(0)  # 假设是正方形
-    b, c, h, w = img.size()
-    
-    # 只支持奇数尺寸的核
-    if k % 2 == 0:
-        print(f"警告: 核大小{k}是偶数，裁剪为{k-1}")
-        k = k - 1
-        kernel = kernel[:k, :k]
-    
-    # 创建输出
-    output = torch.zeros_like(img)
-    
-    # 逐样本、逐通道处理
-    for batch_idx in range(b):
-        sample = img[batch_idx:batch_idx+1]  # 保持4D: [1, c, h, w]
-        
-        for channel_idx in range(c):
-            # 提取单通道图像
-            channel_img = sample[:, channel_idx:channel_idx+1, :, :]  # [1, 1, h, w]
-            
-            # 准备核 - 改为标准的depthwise conv格式
-            conv_kernel = kernel.unsqueeze(0).unsqueeze(0)  # [1, 1, k, k]
-            
-            # 填充
-            padding = k // 2
-            padded = F.pad(channel_img, (padding, padding, padding, padding), mode='reflect')
-            
-            # 应用卷积 - 使用 groups=1 确保通道数匹配
-            filtered = F.conv2d(padded, conv_kernel)
-            
-            # 存储结果
-            output[batch_idx:batch_idx+1, channel_idx:channel_idx+1, :, :] = filtered
-    
-    return output
-
 @MODEL_REGISTRY.register()
 class TGSRModel(SRGANModel):
     """文本引导的超分辨率模型
@@ -338,25 +292,12 @@ class TGSRModel(SRGANModel):
 
     @torch.no_grad()
     def feed_data(self, data):
-        """接收数据并添加二阶退化以获得低质量图像，对文本相关区域进行特殊处理"""
+        """接收数据并添加二阶退化以获得低质量图像"""
         # 存储文本提示
         if self.use_text_features and 'text_prompt' in data:
             self.text_prompts = data['text_prompt']
         else:
             self.text_prompts = [''] * len(data['gt'] if 'gt' in data else data['lq'])
-            
-        # 获取文本区域掩码（如果有）
-        if 'text_regions_mask' in data:
-            self.degradation_mask = data['text_regions_mask'].to(self.device)
-            self.use_targeted_degradation = True
-            # 验证掩码值范围
-            mask_min = self.degradation_mask.min().item()
-            mask_max = self.degradation_mask.max().item()
-            text_region_ratio = (self.degradation_mask < 0.5).float().mean().item() * 100
-        else:
-            self.degradation_mask = None
-            self.use_targeted_degradation = False
-            print("无掩码数据，使用标准退化")
         
         # 解码对象信息（如果有）
         self.objects_info = None
@@ -374,7 +315,7 @@ class TGSRModel(SRGANModel):
                 self.objects_info = None
         
         if self.is_train and self.opt.get('high_order_degradation', True):
-            # 训练数据合成
+            # 训练数据合成 - 严格遵循RealESRGAN方式
             self.gt = data['gt'].to(self.device)
             self.gt_usm = self.usm_sharpener(self.gt)
 
@@ -384,51 +325,9 @@ class TGSRModel(SRGANModel):
 
             ori_h, ori_w = self.gt.size()[2:4]
 
-            # 模糊 - 使用差异化退化（如果有掩码）
-            if self.use_targeted_degradation and self.degradation_mask is not None:
-                # 按照RealESRGAN流程进行模糊处理，对文本区域使用较轻的模糊
-                # 对不同区域分别使用不同参数的完整RealESRGAN退化
-                
-                # 创建文本区域和非文本区域的掩码
-                # 文本区域掩码：退化掩码值小于1.0的区域
-                batch_size = self.gt_usm.size(0)
-                out = torch.zeros_like(self.gt_usm)
-
-                # 针对每个样本单独处理
-                for i in range(batch_size):
-                    sample_mask = self.degradation_mask[i:i+1]  # [1, 1, H, W]
-                    sample_gt = self.gt_usm[i:i+1]  # [1, C, H, W]
-                    
-                    # 创建两个掩码：文本区域和非文本区域
-                    text_region_mask = (sample_mask < 0.5).float()  # 文本区域掩码 (0值区域)
-                    other_region_mask = (sample_mask >= 0.5).float()  # 其他区域掩码 (1值区域)
-                    
-                    # 为文本区域创建轻度的模糊核
-                    text_kernel_size = self.opt.get('text_blur', {}).get('kernel_size', 11)  # 从配置读取，默认11
-                    text_surround_weight = self.opt.get('text_blur', {}).get('surround_weight', 0.01)  # 从配置读取，默认0.01
-                    text_center_weight = self.opt.get('text_blur', {}).get('center_weight', 1.0)  # 从配置读取，默认1.0
-                    
-                    text_kernel = torch.ones((1, 1, text_kernel_size, text_kernel_size), 
-                                          device=self.device) * text_surround_weight
-                    center = text_kernel_size // 2
-                    text_kernel[0, 0, center, center] = text_center_weight  # 中心点权重更高，减少模糊效果
-                    
-                    # 添加归一化处理，确保卷积核权重和为1.0，防止图像变白
-                    text_kernel = text_kernel / text_kernel.sum()
-                    
-                    # 文本区域应用轻度模糊
-                    text_blurred = safe_filter2D(sample_gt, text_kernel)
-                    
-                    # 其他区域应用标准模糊 - 使用第一个kernel1避免批次问题
-                    kernel1_single = self.kernel1[0:1] if self.kernel1.dim() == 4 and self.kernel1.size(0) > 1 else self.kernel1
-                    other_blurred = safe_filter2D(sample_gt, kernel1_single)
-                    
-                    # 使用掩码加权混合
-                    out[i:i+1] = text_blurred * text_region_mask + other_blurred * other_region_mask
-                    
-            else:
-                # 标准模糊
-                out = safe_filter2D(self.gt_usm, self.kernel1)
+            # ----------------------- 第一阶段退化过程 ----------------------- #
+            # 模糊
+            out = filter2D(self.gt_usm, self.kernel1)
             
             # 随机调整大小
             updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob'])[0]
@@ -441,158 +340,27 @@ class TGSRModel(SRGANModel):
             mode = random.choice(['area', 'bilinear', 'bicubic'])
             out = F.interpolate(out, scale_factor=scale, mode=mode)
             
-            # 如果有退化掩码，也需要调整其大小
-            if self.use_targeted_degradation and self.degradation_mask is not None:
-                self.degradation_mask = F.interpolate(
-                    self.degradation_mask, scale_factor=scale, mode='nearest'
-                )
-            
             # 添加噪声
             gray_noise_prob = self.opt['gray_noise_prob']
-            if self.use_targeted_degradation and self.degradation_mask is not None:
-                # 对不同区域分别应用不同强度的噪声，然后混合
-                batch_size = out.size(0)
-                out_with_noise = torch.zeros_like(out)
-                
-                for i in range(batch_size):
-                    sample_mask = self.degradation_mask[i:i+1]  # [1, 1, H, W]
-                    sample_out = out[i:i+1]  # [1, C, H, W]
-                    
-                    # 创建掩码
-                    text_region_mask = (sample_mask < 0.5).float()  # 文本区域掩码 (0值区域)
-                    other_region_mask = (sample_mask >= 0.5).float()  # 其他区域掩码 (1值区域)
-                    
-                    # 文本区域：使用较轻的噪声参数
-                    noise_strength_factor = self.opt.get('text_noise', {}).get('strength_factor', 0.5)  # 从配置读取，默认0.5
-                    text_noise_sigma = np.array(self.opt['noise_range']) * noise_strength_factor
-                    
-                    # 对两个区域分别完整应用RealESRGAN退化
-                    if np.random.uniform() < self.opt['gaussian_noise_prob']:
-                        # 对两个区域分别应用高斯噪声
-                        text_region_noisy = random_add_gaussian_noise_pt(
-                            sample_out, sigma_range=text_noise_sigma, clip=True, 
-                            rounds=False, gray_prob=gray_noise_prob)
-                        
-                        other_region_noisy = random_add_gaussian_noise_pt(
-                            sample_out, sigma_range=self.opt['noise_range'], clip=True, 
-                            rounds=False, gray_prob=gray_noise_prob)
-                        
-                        # 合并结果
-                        out_with_noise[i:i+1] = text_region_noisy * text_region_mask + other_region_noisy * other_region_mask
-                    else:
-                        # 对两个区域分别应用泊松噪声
-                        noise_strength_factor = self.opt.get('text_noise', {}).get('strength_factor', 0.5)  # 从配置读取，默认0.5
-                        text_poisson_scale = np.array(self.opt['poisson_scale_range']) * noise_strength_factor
-                        
-                        text_region_noisy = random_add_poisson_noise_pt(
-                            sample_out, scale_range=text_poisson_scale, gray_prob=gray_noise_prob, 
-                            clip=True, rounds=False)
-                        
-                        other_region_noisy = random_add_poisson_noise_pt(
-                            sample_out, scale_range=self.opt['poisson_scale_range'], 
-                            gray_prob=gray_noise_prob, clip=True, rounds=False)
-                        
-                        # 合并结果
-                        out_with_noise[i:i+1] = text_region_noisy * text_region_mask + other_region_noisy * other_region_mask
-                
-                out = out_with_noise
+            if np.random.uniform() < self.opt['gaussian_noise_prob']:
+                out = random_add_gaussian_noise_pt(
+                    out, sigma_range=self.opt['noise_range'], clip=True, 
+                    rounds=False, gray_prob=gray_noise_prob)
             else:
-                # 标准噪声
-                if np.random.uniform() < self.opt['gaussian_noise_prob']:
-                    out = random_add_gaussian_noise_pt(
-                        out, sigma_range=self.opt['noise_range'], clip=True, 
-                        rounds=False, gray_prob=gray_noise_prob)
+                out = random_add_poisson_noise_pt(
+                    out, scale_range=self.opt['poisson_scale_range'], 
+                    gray_prob=gray_noise_prob, clip=True, rounds=False)
             
-            # JPEG压缩 - 为文本区域使用较高的质量
-            if self.use_targeted_degradation and self.degradation_mask is not None:
-                batch_size = out.size(0)
-                out_compressed = torch.zeros_like(out)
-                
-                for i in range(batch_size):
-                    sample_mask = self.degradation_mask[i:i+1]
-                    sample_out = out[i:i+1]
-                    
-                    # 创建掩码
-                    text_region_mask = (sample_mask < 0.5).float()  # 文本区域掩码 (0值区域)
-                    other_region_mask = (sample_mask >= 0.5).float()  # 其他区域掩码 (1值区域)
-                    
-                    # 对两个区域分别完整应用不同质量的JPEG压缩
-                    quality_min_factor = self.opt.get('text_jpeg', {}).get('quality_min_factor', 1.5)  # 从配置读取，默认1.5
-                    quality_max_factor = self.opt.get('text_jpeg', {}).get('quality_max_factor', 1.2)  # 从配置读取，默认1.2
-                    quality_max = self.opt.get('text_jpeg', {}).get('quality_max', 90)  # 从配置读取，默认90
-                    
-                    text_jpeg_quality = torch.FloatTensor(1).uniform_(
-                        min(self.opt['jpeg_range2'][0] * quality_min_factor, quality_max),  # 提高最低质量
-                        min(100, self.opt['jpeg_range2'][1] * quality_max_factor)  # 最高不超过100
-                    ).to(self.device)
-                    
-                    other_jpeg_quality = torch.FloatTensor(1).uniform_(
-                        *self.opt['jpeg_range2']
-                    ).to(self.device)
-                    
-                    # 进行压缩
-                    sample_out = torch.clamp(sample_out, 0, 1)
-                    
-                    # 对两个区域分别完整应用JPEG压缩
-                    text_compressed = self.jpeger(sample_out, quality=text_jpeg_quality) 
-                    other_compressed = self.jpeger(sample_out, quality=other_jpeg_quality)
-                    
-                    # 合并结果 - 使用掩码
-                    out_compressed[i:i+1] = text_compressed * text_region_mask + other_compressed * other_region_mask
-                
-                out = out_compressed
-            else:
-                # 标准JPEG压缩
-                jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range'])
-                out = torch.clamp(out, 0, 1)  # 裁剪到[0, 1]，否则JPEGer会产生不良伪影
-                out = self.jpeger(out, quality=jpeg_p)
-            
-            # clamp and round
-            self.lq = torch.clamp((out * 255.0).round(), 0, 255) / 255.
+            # JPEG压缩
+            jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range'])
+            out = torch.clamp(out, 0, 1)  # 裁剪到[0, 1]，否则JPEGer会产生不良伪影
+            out = self.jpeger(out, quality=jpeg_p)
 
             # ----------------------- 第二阶段退化过程 ----------------------- #
-            # 模糊 - 类似地对文本区域使用较轻的模糊
+            # 模糊
             if np.random.uniform() < self.opt['second_blur_prob']:
-                if self.use_targeted_degradation and self.degradation_mask is not None:
-                    # 对不同区域分别使用不同参数的完整RealESRGAN退化
-                    batch_size = out.size(0)
-                    out_blurred = torch.zeros_like(out)
-                    
-                    for i in range(batch_size):
-                        sample_mask = self.degradation_mask[i:i+1]  # [1, 1, H, W]
-                        sample_out = out[i:i+1]  # [1, C, H, W]
-                        
-                        # 创建文本区域和非文本区域的掩码
-                        text_region_mask = (sample_mask < 0.5).float()  # 文本区域掩码 (0值区域)
-                        other_region_mask = (sample_mask >= 0.5).float()  # 其他区域掩码 (1值区域)
-                        
-                        # 为文本区域创建轻度的模糊核
-                        text_kernel_size = self.opt.get('text_blur', {}).get('kernel_size', 11)  # 从配置读取，默认11
-                        text_surround_weight = self.opt.get('text_blur', {}).get('surround_weight', 0.01)  # 从配置读取，默认0.01
-                        text_center_weight = self.opt.get('text_blur', {}).get('center_weight', 1.0)  # 从配置读取，默认1.0
-                        
-                        text_kernel = torch.ones((1, 1, text_kernel_size, text_kernel_size), 
-                                            device=self.device) * text_surround_weight
-                        center = text_kernel_size // 2
-                        text_kernel[0, 0, center, center] = text_center_weight  # 中心点权重更高，减少模糊效果
-                        
-                        # 添加归一化处理，确保卷积核权重和为1.0，防止图像变白
-                        text_kernel = text_kernel / text_kernel.sum()
-                        
-                        # 文本区域应用轻度模糊
-                        text_blurred = safe_filter2D(sample_out, text_kernel)
-                        
-                        # 其他区域应用标准模糊 - 使用第一个kernel2避免批次问题
-                        kernel2_single = self.kernel2[0:1] if self.kernel2.dim() == 4 and self.kernel2.size(0) > 1 else self.kernel2
-                        other_blurred = safe_filter2D(sample_out, kernel2_single)
-                        
-                        # 使用掩码加权混合
-                        out_blurred[i:i+1] = text_blurred * text_region_mask + other_blurred * other_region_mask
-                    
-                    out = out_blurred
-                else:
-                    out = safe_filter2D(out, self.kernel2)
-                    
+                out = filter2D(out, self.kernel2)
+                
             # 随机调整大小
             updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob2'])[0]
             if updown_type == 'up':
@@ -604,266 +372,48 @@ class TGSRModel(SRGANModel):
             mode = random.choice(['area', 'bilinear', 'bicubic'])
             out = F.interpolate(
                 out, size=(int(ori_h / self.opt['scale'] * scale), int(ori_w / self.opt['scale'] * scale)), mode=mode)
-                
-            # 同样调整掩码大小
-            if self.use_targeted_degradation and self.degradation_mask is not None:
-                self.degradation_mask = F.interpolate(
-                    self.degradation_mask, 
-                    size=(int(ori_h / self.opt['scale'] * scale), int(ori_w / self.opt['scale'] * scale)), 
-                    mode='nearest'
-                )
-                
-            # 添加噪声 - 与前一阶段类似，但使用第二阶段的参数
+            
+            # 添加噪声
             gray_noise_prob = self.opt['gray_noise_prob2']
-            if self.use_targeted_degradation and self.degradation_mask is not None:
-                # 对不同区域分别应用不同强度的噪声，然后混合
-                batch_size = out.size(0)
-                out_with_noise = torch.zeros_like(out)
-                
-                for i in range(batch_size):
-                    sample_mask = self.degradation_mask[i:i+1]  # [1, 1, H, W]
-                    sample_out = out[i:i+1]  # [1, C, H, W]
-                    
-                    # 创建掩码
-                    text_region_mask = (sample_mask < 0.5).float()  # 文本区域掩码 (0值区域)
-                    other_region_mask = (sample_mask >= 0.5).float()  # 其他区域掩码 (1值区域)
-                    
-                    # 对两个区域分别完整应用RealESRGAN退化
-                    if np.random.uniform() < self.opt['gaussian_noise_prob2']:
-                        # 文本区域：使用较轻的噪声参数
-                        noise_strength_factor = self.opt.get('text_noise', {}).get('strength_factor', 0.5)  # 从配置读取，默认0.5
-                        text_noise_sigma = np.array(self.opt['noise_range2']) * noise_strength_factor
-                        
-                        # 对两个区域分别应用高斯噪声
-                        text_region_noisy = random_add_gaussian_noise_pt(
-                            sample_out, sigma_range=text_noise_sigma, clip=True, 
-                            rounds=False, gray_prob=gray_noise_prob)
-                        
-                        other_region_noisy = random_add_gaussian_noise_pt(
-                            sample_out, sigma_range=self.opt['noise_range2'], clip=True, 
-                            rounds=False, gray_prob=gray_noise_prob)
-                        
-                        # 合并结果
-                        out_with_noise[i:i+1] = text_region_noisy * text_region_mask + other_region_noisy * other_region_mask
-                    else:
-                        # 文本区域：使用较轻的泊松噪声参数
-                        noise_strength_factor = self.opt.get('text_noise', {}).get('strength_factor', 0.5)  # 从配置读取，默认0.5
-                        text_poisson_scale = np.array(self.opt['poisson_scale_range2']) * noise_strength_factor
-                        
-                        # 对两个区域分别应用泊松噪声
-                        text_region_noisy = random_add_poisson_noise_pt(
-                            sample_out, scale_range=text_poisson_scale, gray_prob=gray_noise_prob, 
-                            clip=True, rounds=False)
-                        
-                        other_region_noisy = random_add_poisson_noise_pt(
-                            sample_out, scale_range=self.opt['poisson_scale_range2'], 
-                            gray_prob=gray_noise_prob, clip=True, rounds=False)
-                        
-                        # 合并结果
-                        out_with_noise[i:i+1] = text_region_noisy * text_region_mask + other_region_noisy * other_region_mask
-                    
-                out = out_with_noise
+            if np.random.uniform() < self.opt['gaussian_noise_prob2']:
+                out = random_add_gaussian_noise_pt(
+                    out, sigma_range=self.opt['noise_range2'], clip=True, 
+                    rounds=False, gray_prob=gray_noise_prob)
             else:
-                # 标准噪声
-                if np.random.uniform() < self.opt['gaussian_noise_prob2']:
-                    out = random_add_gaussian_noise_pt(
-                        out, sigma_range=self.opt['noise_range2'], clip=True, 
-                        rounds=False, gray_prob=gray_noise_prob)
-                else:
-                    out = random_add_poisson_noise_pt(
-                        out, scale_range=self.opt['poisson_scale_range2'], 
-                        gray_prob=gray_noise_prob, clip=True, rounds=False)
+                out = random_add_poisson_noise_pt(
+                    out, scale_range=self.opt['poisson_scale_range2'], 
+                    gray_prob=gray_noise_prob, clip=True, rounds=False)
   
             # JPEG压缩 + 最终sinc滤波器 - 两种顺序
             if np.random.uniform() < 0.5:
                 # 1. [调整回原尺寸 + sinc滤波] + JPEG压缩
                 mode = random.choice(['area', 'bilinear', 'bicubic'])
                 out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
+                out = filter2D(out, self.sinc_kernel)
                 
-                # 同样调整掩码大小
-                if self.use_targeted_degradation and self.degradation_mask is not None:
-                    self.degradation_mask = F.interpolate(
-                        self.degradation_mask, 
-                        size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), 
-                        mode='nearest'
-                    )
-                
-                # 差异化sinc滤波
-                if self.use_targeted_degradation and self.degradation_mask is not None:
-                    # 对不同区域分别应用不同sinc滤波
-                    batch_size = out.size(0)
-                    out_sinc = torch.zeros_like(out)
-                    
-                    for i in range(batch_size):
-                        sample_mask = self.degradation_mask[i:i+1]
-                        sample_out = out[i:i+1]
-                        
-                        # 创建掩码
-                        text_region_mask = (sample_mask < 0.5).float()  # 文本区域掩码 (0值区域)
-                        other_region_mask = (sample_mask >= 0.5).float()  # 其他区域掩码 (1值区域)
-                        
-                        # 对文本区域，几乎不应用sinc滤波
-                        text_sinc = sample_out  # 不应用滤波，保持原样
-                        
-                        # 对其他区域应用sinc滤波 - 使用单个kernel避免批次问题
-                        sinc_kernel_single = self.sinc_kernel if self.sinc_kernel.dim() == 2 else self.sinc_kernel[0:1]
-                        other_sinc = safe_filter2D(sample_out, sinc_kernel_single)
-                        
-                        # 合并结果
-                        out_sinc[i:i+1] = text_sinc * text_region_mask + other_sinc * other_region_mask
-                    
-                    out = out_sinc
-                else:
-                    out = safe_filter2D(out, self.sinc_kernel)
-                
-                # JPEG压缩，文本区域质量较高
-                if self.use_targeted_degradation and self.degradation_mask is not None:
-                    batch_size = out.size(0)
-                    out_compressed = torch.zeros_like(out)
-                    
-                    for i in range(batch_size):
-                        sample_mask = self.degradation_mask[i:i+1]
-                        sample_out = out[i:i+1]
-                        
-                        # 创建掩码
-                        text_region_mask = (sample_mask < 0.5).float()  # 文本区域掩码 (0值区域)
-                        other_region_mask = (sample_mask >= 0.5).float()  # 其他区域掩码 (1值区域)
-                        
-                        # 对两个区域分别完整应用不同质量的JPEG压缩
-                        quality_min_factor = self.opt.get('text_jpeg', {}).get('quality_min_factor', 1.5)  # 从配置读取，默认1.5
-                        quality_max_factor = self.opt.get('text_jpeg', {}).get('quality_max_factor', 1.2)  # 从配置读取，默认1.2
-                        quality_max = self.opt.get('text_jpeg', {}).get('quality_max', 90)  # 从配置读取，默认90
-                        
-                        text_jpeg_quality = torch.FloatTensor(1).uniform_(
-                            min(self.opt['jpeg_range2'][0] * quality_min_factor, quality_max),  # 提高最低质量
-                            min(100, self.opt['jpeg_range2'][1] * quality_max_factor)  # 最高不超过100
-                        ).to(self.device)
-                        
-                        other_jpeg_quality = torch.FloatTensor(1).uniform_(
-                            *self.opt['jpeg_range2']
-                        ).to(self.device)
-                        
-                        # 进行压缩
-                        sample_out = torch.clamp(sample_out, 0, 1)
-                        
-                        # 对两个区域分别完整应用JPEG压缩
-                        text_compressed = self.jpeger(sample_out, quality=text_jpeg_quality)
-                        other_compressed = self.jpeger(sample_out, quality=other_jpeg_quality)
-                        
-                        # 合并结果
-                        out_compressed[i:i+1] = text_compressed * text_region_mask + other_compressed * other_region_mask
-                    
-                    out = out_compressed
-                else:
-                    jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range'])
-                    out = torch.clamp(out, 0, 1)
-                    out = self.jpeger(out, quality=jpeg_p)
+                # JPEG压缩
+                jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range2'])
+                out = torch.clamp(out, 0, 1)
+                out = self.jpeger(out, quality=jpeg_p)
             else:
                 # 2. JPEG压缩 + [调整回原尺寸 + sinc滤波]
-                # JPEG压缩，文本区域质量较高
-                if self.use_targeted_degradation and self.degradation_mask is not None:
-                    batch_size = out.size(0)
-                    out_compressed = torch.zeros_like(out)
-                    
-                    for i in range(batch_size):
-                        sample_mask = self.degradation_mask[i:i+1]
-                        sample_out = out[i:i+1]
-                        
-                        # 创建掩码
-                        text_region_mask = (sample_mask < 0.5).float()  # 文本区域掩码 (0值区域)
-                        other_region_mask = (sample_mask >= 0.5).float()  # 其他区域掩码 (1值区域)
-                        
-                        # 对两个区域分别完整应用不同质量的JPEG压缩
-                        quality_min_factor = self.opt.get('text_jpeg', {}).get('quality_min_factor', 1.5)  # 从配置读取，默认1.5
-                        quality_max_factor = self.opt.get('text_jpeg', {}).get('quality_max_factor', 1.2)  # 从配置读取，默认1.2
-                        quality_max = self.opt.get('text_jpeg', {}).get('quality_max', 90)  # 从配置读取，默认90
-                        
-                        text_jpeg_quality = torch.FloatTensor(1).uniform_(
-                            min(self.opt['jpeg_range2'][0] * quality_min_factor, quality_max),  # 提高最低质量
-                            min(100, self.opt['jpeg_range2'][1] * quality_max_factor)  # 最高不超过100
-                        ).to(self.device)
-                        
-                        other_jpeg_quality = torch.FloatTensor(1).uniform_(
-                            *self.opt['jpeg_range2']
-                        ).to(self.device)
-                        
-                        # 进行压缩
-                        sample_out = torch.clamp(sample_out, 0, 1)
-                        
-                        # 对两个区域分别完整应用JPEG压缩
-                        text_compressed = self.jpeger(sample_out, quality=text_jpeg_quality)
-                        other_compressed = self.jpeger(sample_out, quality=other_jpeg_quality)
-                        
-                        # 合并结果
-                        out_compressed[i:i+1] = text_compressed * text_region_mask + other_compressed * other_region_mask
-                    
-                    out = out_compressed
-                else:
-                    jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range'])
-                    out = torch.clamp(out, 0, 1)
-                    out = self.jpeger(out, quality=jpeg_p)
+                # JPEG压缩
+                jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range2'])
+                out = torch.clamp(out, 0, 1)
+                out = self.jpeger(out, quality=jpeg_p)
                     
                 # 调整回原尺寸
                 mode = random.choice(['area', 'bilinear', 'bicubic'])
                 out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
-                
-                # 同样调整掩码大小
-                if self.use_targeted_degradation and self.degradation_mask is not None:
-                    self.degradation_mask = F.interpolate(
-                        self.degradation_mask, 
-                        size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), 
-                        mode='nearest'
-                    )
-                
-                # 差异化sinc滤波
-                if self.use_targeted_degradation and self.degradation_mask is not None:
-                    # 对不同区域分别应用不同sinc滤波
-                    batch_size = out.size(0)
-                    out_sinc = torch.zeros_like(out)
-                    
-                    for i in range(batch_size):
-                        sample_mask = self.degradation_mask[i:i+1]
-                        sample_out = out[i:i+1]
-                        
-                        # 创建掩码
-                        text_region_mask = (sample_mask < 0.5).float()  # 文本区域掩码 (0值区域)
-                        other_region_mask = (sample_mask >= 0.5).float()  # 其他区域掩码 (1值区域)
-                        
-                        # 对文本区域，几乎不应用sinc滤波
-                        text_sinc = sample_out  # 不应用滤波，保持原样
-                        
-                        # 对其他区域应用sinc滤波 - 使用单个kernel避免批次问题
-                        sinc_kernel_single = self.sinc_kernel if self.sinc_kernel.dim() == 2 else self.sinc_kernel[0:1]
-                        other_sinc = safe_filter2D(sample_out, sinc_kernel_single)
-                        
-                        # 合并结果
-                        out_sinc[i:i+1] = text_sinc * text_region_mask + other_sinc * other_region_mask
-                    
-                    out = out_sinc
-                else:
-                    out = safe_filter2D(out, self.sinc_kernel)
+                out = filter2D(out, self.sinc_kernel)
             
             # clamp and round
             self.lq = torch.clamp((out * 255.0).round(), 0, 255) / 255.
 
-            # 直接调整图像大小到目标尺寸 (1/scale)，不使用随机裁剪
+            # 随机裁剪
             gt_size = self.opt['gt_size']
-            scale = self.opt['scale']
-            
-            # 确保GT图像为目标大小
-            if self.gt.shape[2:] != (gt_size, gt_size):
-                self.gt = F.interpolate(self.gt, size=(gt_size, gt_size), mode='bicubic', align_corners=True)
-                self.gt_usm = F.interpolate(self.gt_usm, size=(gt_size, gt_size), mode='bicubic', align_corners=True)
-            
-            # 确保LQ图像为 GT/scale 大小
-            lq_size = gt_size // scale
-            self.lq = F.interpolate(self.lq, size=(lq_size, lq_size), mode='bicubic', align_corners=True)
-            
-            # 同样调整掩码大小
-            if self.use_targeted_degradation and self.degradation_mask is not None:
-                self.degradation_mask = F.interpolate(
-                    self.degradation_mask, size=(lq_size, lq_size), mode='nearest'
-                )
+            (self.gt, self.gt_usm), self.lq = paired_random_crop([self.gt, self.gt_usm], self.lq, gt_size,
+                                                                self.opt['scale'])
             
             # 训练数据队列
             self._dequeue_and_enqueue()
@@ -902,7 +452,7 @@ class TGSRModel(SRGANModel):
         if block_idx is not None and hasattr(self.net_t, 'with_position') and self.net_t.with_position:
             # 如果文本引导网络支持位置信息，可以创建位置编码
             # 例如，可以使用one-hot编码表示位置
-            num_blocks = len(self.net_g.RRDB_trunk)
+            num_blocks = len(self.net_g.body)
             position_info = torch.zeros(features.size(0), num_blocks, device=features.device)
             position_info[:, block_idx] = 1.0
         
@@ -930,93 +480,6 @@ class TGSRModel(SRGANModel):
         Returns:
             sr: 超分辨率输出
         """
-        # 属性名适配 - 解决body与RRDB_trunk的命名差异
-        if hasattr(self.net_g, 'body') and not hasattr(self.net_g, 'RRDB_trunk'):
-            # 仅首次调用时打印信息
-            if not hasattr(self, '_attribute_adapted'):
-                print("适配RRDBNet属性名：将body映射为RRDB_trunk，conv_body映射为trunk_conv")
-                self._attribute_adapted = True
-                
-            # 创建属性别名，不修改原始对象
-            self.net_g.RRDB_trunk = self.net_g.body
-            self.net_g.trunk_conv = self.net_g.conv_body
-        
-        # 适配上采样层名称
-        if (not hasattr(self.net_g, 'upconv1') or not hasattr(self.net_g, 'upconv2')) and not hasattr(self, '_upsampler_adapted'):
-            print("适配RRDBNet上采样层命名")
-            self._upsampler_adapted = True
-            
-            # 可能的上采样层命名方式
-            possible_names = [
-                ('upblock1', 'upblock2'),
-                ('upsample1', 'upsample2'),
-                ('upsampler1', 'upsampler2'),
-                ('upconv_1', 'upconv_2'),
-                ('upsample_block1', 'upsample_block2'),
-                ('conv_up1', 'conv_up2')  # 添加这个匹配RRDBNet实际使用的名称
-            ]
-            
-            # 检查各种可能的命名
-            for name1, name2 in possible_names:
-                if hasattr(self.net_g, name1) and hasattr(self.net_g, name2):
-                    self.net_g.upconv1 = getattr(self.net_g, name1)
-                    self.net_g.upconv2 = getattr(self.net_g, name2)
-                    print(f"上采样层已映射: {name1} -> upconv1, {name2} -> upconv2")
-                    break
-            
-            # 如果没有找到预定义的名称对，尝试推断命名模式
-            if not hasattr(self.net_g, 'upconv1'):
-                # 查找所有可能的上采样相关属性
-                upsampler_attrs = [attr for attr in dir(self.net_g) if 'up' in attr.lower() and not attr.startswith('_')]
-                if len(upsampler_attrs) >= 2:
-                    print(f"找到可能的上采样层: {upsampler_attrs}")
-                    # 假设前两个是我们需要的
-                    self.net_g.upconv1 = getattr(self.net_g, upsampler_attrs[0])
-                    self.net_g.upconv2 = getattr(self.net_g, upsampler_attrs[1])
-                    print(f"上采样层已映射: {upsampler_attrs[0]} -> upconv1, {upsampler_attrs[1]} -> upconv2")
-            
-            # 检查lrelu
-            if not hasattr(self.net_g, 'lrelu'):
-                # 查找可能的激活函数
-                for attr in dir(self.net_g):
-                    if 'relu' in attr.lower() or 'activ' in attr.lower():
-                        self.net_g.lrelu = getattr(self.net_g, attr)
-                        print(f"激活函数已映射: {attr} -> lrelu")
-                        break
-                # 如果未找到，创建一个默认的lrelu
-                if not hasattr(self.net_g, 'lrelu'):
-                    import torch.nn as nn
-                    self.net_g.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
-                    print("创建默认的LeakyReLU激活函数")
-                    
-            # 检查最后一个卷积层
-            if not hasattr(self.net_g, 'conv_last'):
-                for attr in dir(self.net_g):
-                    if 'last' in attr.lower() or 'final' in attr.lower() or 'out' in attr.lower():
-                        if 'conv' in attr.lower():
-                            self.net_g.conv_last = getattr(self.net_g, attr)
-                            print(f"最后一个卷积层已映射: {attr} -> conv_last")
-                            break
-                            
-            # 检查HRconv
-            if not hasattr(self.net_g, 'HRconv'):
-                for attr in dir(self.net_g):
-                    if 'hr' in attr.lower() and 'conv' in attr.lower():
-                        self.net_g.HRconv = getattr(self.net_g, attr)
-                        print(f"HR卷积层已映射: {attr} -> HRconv")
-                        break
-                # 如果未找到，可能是直接使用conv_last
-                if not hasattr(self.net_g, 'HRconv'):
-                    if hasattr(self.net_g, 'conv_last'):
-                        # 使用恒等映射，保持与原始结构兼容
-                        self.net_g.HRconv = nn.Identity()
-                        print("创建默认的HR卷积层(Identity)")
-        
-        # 安全检查 - 如果仍然没有所需属性，回退到简单方式
-        if not hasattr(self.net_g, 'RRDB_trunk') or not hasattr(self.net_g, 'trunk_conv'):
-            print("警告：找不到RRDB_trunk或trunk_conv属性，使用简单前向传播")
-            return self.net_g(x)
-        
         # 编码文本（如果需要）
         if self.use_text_features and apply_guidance and hasattr(self, 'net_t'):
             with torch.no_grad() if self.freeze_text_encoder else torch.enable_grad():
@@ -1027,68 +490,115 @@ class TGSRModel(SRGANModel):
         # 浅层特征提取
         fea = self.net_g.conv_first(x)
         
-        # RRDB主干处理
+        # 主干处理
         trunk = fea
         attention_maps = []
         
         # 确定在哪些位置应用文本引导
         if self.use_text_features and apply_guidance and text_hidden is not None and text_pooled is not None:
-            num_blocks = len(self.net_g.RRDB_trunk)
-            # 选择更合理的引导位置: 浅层、中层和深层
-            guidance_positions = [num_blocks // 6, num_blocks // 2, num_blocks * 5 // 6]
+            num_blocks = len(self.net_g.body)
+            
+            # 改进：自适应分层引导策略 - 更多引导位置及动态引导强度
+            if num_blocks >= 20:  # 模型较大时使用5个引导点
+                # 设置引导位置 - 在不同层次均匀分布
+                guidance_positions = [
+                    num_blocks // 8,             # 浅层 - 捕获边缘和纹理
+                    num_blocks // 4,             # 浅中层 - 捕获局部特征
+                    num_blocks // 2,             # 中层 - 捕获中等规模特征
+                    num_blocks * 3 // 4,         # 中深层 - 捕获对象部件
+                    num_blocks - 2               # 深层 - 捕获整体语义
+                ]
+                
+                # 为不同层级设置引导强度 - 中间层级给予更高的权重
+                guidance_weights = {
+                    num_blocks // 8: 0.6,        # 浅层权重
+                    num_blocks // 4: 0.8,        # 浅中层
+                    num_blocks // 2: 1.0,        # 中层使用最高权重
+                    num_blocks * 3 // 4: 0.8,    # 中深层
+                    num_blocks - 2: 0.6          # 深层使用较低权重
+                }
+            
+            # 验证时使用所有引导位置，训练时可选随机丢弃部分引导位置
+            if self.is_train and random.random() < 0.3:  # 30%概率随机丢弃部分引导位置
+                # 至少保留3个引导位置
+                keep_count = max(3, len(guidance_positions) - random.randint(1, 2))
+                selected_positions = sorted(random.sample(guidance_positions, keep_count))
+                guidance_positions = selected_positions
             
             # 缓存特征用于损失计算
             self.original_features_cache = {}
             self.enhanced_features_cache = {}
             
-            for i, block in enumerate(self.net_g.RRDB_trunk):
+            # 防止过拟合和注意力崩塌的随机屏蔽策略
+            apply_masking = self.is_train and random.random() < 0.3  # 30%概率在训练时应用
+            
+            for i, block in enumerate(self.net_g.body):
                 trunk = block(trunk)
                 
-                # 在关键位置应用文本引导
+                # 在指定位置应用文本引导
                 if i in guidance_positions:
                     # 缓存原始特征用于损失计算
                     if self.is_train:
-                        self.original_features_cache[i] = trunk.clone().detach()
+                        self.original_features_cache[i] = trunk.clone()
+                    
+                    # 随机特征掩码 - 防止模型过度依赖特定区域
+                    if apply_masking:
+                        b, c, h, w = trunk.shape
+                        mask = torch.rand(b, 1, h, w, device=trunk.device) > 0.2
+                        mask = mask.float().expand_as(trunk)
+                        
+                        # 应用掩码，保留80%的特征，其余置为均值
+                        mean_val = trunk.mean(dim=[2, 3], keepdim=True)
+                        trunk = trunk * mask + mean_val * (1 - mask)
                     
                     # 文本引导
-                    trunk, attn_maps = self.apply_text_guidance(trunk, text_hidden, text_pooled, block_idx=i)
+                    enhanced_features, attn_maps = self.apply_text_guidance(trunk, text_hidden, text_pooled, block_idx=i)
+                    
+                    # 新增：应用引导强度权重
+                    weight = guidance_weights.get(i, 1.0)
+                    # 加权融合：原始特征 + 权重 * 增强特征
+                    trunk = trunk + weight * (enhanced_features - trunk)
                     
                     # 缓存增强后的特征
                     if self.is_train:
-                        self.enhanced_features_cache[i] = trunk.clone().detach()
+                        self.enhanced_features_cache[i] = trunk.clone()
                     
                     # 保存注意力图
                     if attn_maps is not None and (not self.is_train or getattr(self, 'save_attention', False)):
                         if isinstance(attn_maps, list):
-                            # 注意力logits现在需要应用sigmoid才能用于可视化
                             processed_attn_maps = [torch.sigmoid(logits) for logits in attn_maps if logits is not None]
                             attention_maps.extend(processed_attn_maps)
                         else:
-                            # 单个注意力图也需要应用sigmoid
                             processed_attn = torch.sigmoid(attn_maps)
                             attention_maps.append(processed_attn)
+                    
+                    # 随机重置特征 - 防止过度依赖注意力
+                    if self.is_train and random.random() < 0.1:  # 10%概率在训练时应用
+                        b, c, h, w = trunk.shape
+                        reset_mask = torch.rand(b, 1, h, w, device=trunk.device) < 0.2
+                        reset_mask = reset_mask.float().expand_as(trunk)
+                        
+                        # 保存原始特征用于重置
+                        orig_feat = self.original_features_cache[i]
+                        
+                        # 部分重置为原始特征
+                        trunk = trunk * (1 - reset_mask) + orig_feat * reset_mask
         else:
             # 不使用文本引导
-            for block in self.net_g.RRDB_trunk:
+            for block in self.net_g.body:
                 trunk = block(trunk)
         
         # 残差连接
-        trunk = self.net_g.trunk_conv(trunk)
+        trunk = self.net_g.conv_body(trunk)
         fea = fea + trunk
         
         # 上采样
-        try:
-            # 尝试使用标准上采样路径
-            fea = self.net_g.lrelu(self.net_g.upconv1(F.interpolate(fea, scale_factor=2, mode='nearest')))
-            fea = self.net_g.lrelu(self.net_g.upconv2(F.interpolate(fea, scale_factor=2, mode='nearest')))
-            
-            # 最终输出
-            out = self.net_g.conv_last(self.net_g.lrelu(self.net_g.HRconv(fea)))
-        except (AttributeError, RuntimeError) as e:
-            # 出错时，尝试调用完整的前向传播
-            print(f"上采样出错: {e}，使用模型自带的前向传播")
-            # 直接使用模型自带的前向方法
-            out = self.net_g(x)
+        fea = self.net_g.conv_up1(F.interpolate(fea, scale_factor=2, mode='nearest'))
+        fea = self.net_g.conv_up2(F.interpolate(fea, scale_factor=2, mode='nearest'))
+        
+        # 最终输出
+        out = self.net_g.conv_hr(fea)
+        out = self.net_g.conv_last(out)
         
         # 保存注意力图
         if len(attention_maps) > 0:
@@ -1134,7 +644,7 @@ class TGSRModel(SRGANModel):
                 # 直接从GT下采样生成LQ（简单方式）
                 self.gt = val_data['gt'].to(self.device)
                 self.lq = F.interpolate(self.gt, scale_factor=1/self.opt['scale'], mode='bicubic')
-            
+
             # 获取图像名称
             img_name = osp.splitext(osp.basename(val_data['gt_path'][0]))[0]
             
@@ -1203,14 +713,23 @@ class TGSRModel(SRGANModel):
                     unguided_img = tensor2img([unguided_output.detach().cpu()])
                     # 创建对比图
                     if self.opt.get('val', {}).get('save_comparison', False):
-                        # 创建并排对比图
+                        # 创建三列对比图（LQ、无引导、有引导）
                         guided_img = sr_img
+                        lq_img = tensor2img([self.lq])
+                        
                         h, w = guided_img.shape[:2]
-                        comparison = np.zeros((h, w*2, 3), dtype=np.uint8)
-                        comparison[:, :w] = unguided_img
-                        comparison[:, w:] = guided_img
+                        # 将lq调整到相同大小以便对比显示
+                        lq_img = cv2.resize(lq_img, (w, h), interpolation=cv2.INTER_NEAREST)
+                        
+                        comparison = np.zeros((h, w*3, 3), dtype=np.uint8)
+                        comparison[:, :w] = lq_img        # 第一列显示LQ
+                        comparison[:, w:2*w] = unguided_img  # 第二列显示无引导结果
+                        comparison[:, 2*w:] = guided_img    # 第三列显示引导结果
+                        
                         # 添加分割线
                         comparison[:, w-1:w+1] = [0, 0, 255]  # 红色分割线
+                        comparison[:, 2*w-1:2*w+1] = [0, 0, 255]  # 红色分割线
+                        
                         save_comp_path = osp.join(save_path_root, f'{img_name}_comparison_{current_iter}.png')
                         imwrite(comparison, save_comp_path)
             
@@ -1323,6 +842,18 @@ class TGSRModel(SRGANModel):
             self.optimizer_g.zero_grad()
             if self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t'):
                 self.optimizer_t.zero_grad()
+                
+        # 新增：动态调整注意力温度 - 从高温到低温
+        # 高温使得注意力分布更均匀，低温使得注意力更加集中
+        if hasattr(self, 'net_t'):
+            total_iters = self.opt.get('train', {}).get('total_iter', 400000)
+            # 温度从1.5逐渐降低到0.5
+            temp = max(0.5, 1.5 - current_iter / total_iters)
+            
+            # 为每个带有temperature参数的模块设置温度
+            for module in self.net_t.modules():
+                if hasattr(module, 'temperature'):
+                    module.temperature = temp
         
         # 前向传播，应用文本引导
         self.output = self.forward_sr_network(self.lq, apply_guidance=True)
@@ -1414,6 +945,12 @@ class TGSRModel(SRGANModel):
                             l_t_attn = l_t_attn / self.accumulate_grad_batches  # 归一化
                             l_t_total += l_t_attn
                             loss_dict[f'l_t_attn_{pos}'] = l_t_attn
+                            
+                            # 新增：如果注意力损失太大，可能表明已经崩塌，增加熵正则化权重
+                            if l_t_attn.item() > 5.0 and hasattr(self.cri_attention, 'entropy_weight'):
+                                # 动态增加熵权重，鼓励更均匀的注意力
+                                self.cri_attention.entropy_weight = min(0.3, self.cri_attention.entropy_weight * 1.2)
+                                self.logger.info(f"检测到高注意力损失，增加熵权重至:{self.cri_attention.entropy_weight:.4f}")
             
             # 3. 特征细化损失
             if (hasattr(self, 'cri_refinement') and hasattr(self, 'original_features_cache') 
@@ -1433,6 +970,10 @@ class TGSRModel(SRGANModel):
             if l_t_total > 0:
                 loss_dict['l_t_total'] = l_t_total
                 l_t_total.backward()
+                
+                # 新增：梯度裁剪，防止梯度爆炸
+                if self.is_train:
+                    torch.nn.utils.clip_grad_norm_(self.net_t.parameters(), max_norm=1.0)
         
         # 增加梯度计数
         self.grad_count += 1
@@ -1502,10 +1043,20 @@ class TGSRModel(SRGANModel):
             # 提取第一个样本的注意力图并应用sigmoid将logits转换为概率
             attention_2d = torch.sigmoid(attn_logits[0, 0]).cpu().detach()
             
-            # 归一化
+            # 归一化 - 改进的对比度增强方法
             min_val = attention_2d.min()
             max_val = attention_2d.max()
-            normalized_attn = (attention_2d - min_val) / (max_val - min_val + 1e-8)
+            
+            # 如果差距太小，强制拉开差距
+            if max_val - min_val < 0.3:
+                # 使用更强的对比度增强
+                mean_val = attention_2d.mean()
+                std_val = attention_2d.std()
+                # 提高标准差以增加对比度
+                normalized_attn = torch.clamp((attention_2d - mean_val) / (std_val * 2 + 1e-8) + 0.5, 0, 1)
+            else:
+                # 标准归一化
+                normalized_attn = (attention_2d - min_val) / (max_val - min_val + 1e-8)
             
             # 转换为numpy
             attention_np = normalized_attn.numpy()
@@ -1551,8 +1102,36 @@ class TGSRModel(SRGANModel):
         # 确保尺寸匹配
         combined_map = cv2.resize(combined_map, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
         
+        # 应用非线性变换增强对比度 - 使用自适应阈值化
+        # 1. 计算均值和标准差
+        mean_val = np.mean(combined_map)
+        std_val = np.std(combined_map)
+        
+        # 2. 根据均值和标准差设置阈值，强化高注意力区域，抑制低注意力区域
+        enhanced_map = np.zeros_like(combined_map)
+        high_threshold = mean_val + 0.5 * std_val
+        low_threshold = mean_val - 0.5 * std_val
+        
+        # 高于高阈值的区域
+        high_mask = combined_map > high_threshold
+        # 低于低阈值的区域
+        low_mask = combined_map < low_threshold
+        # 中间区域
+        mid_mask = ~(high_mask | low_mask)
+        
+        # 高注意力区域增强
+        enhanced_map[high_mask] = 0.75 + 0.25 * (combined_map[high_mask] - high_threshold) / (1 - high_threshold + 1e-8)
+        # 低注意力区域降低
+        enhanced_map[low_mask] = 0.25 * combined_map[low_mask] / (low_threshold + 1e-8)
+        # 中间区域线性映射
+        if np.any(mid_mask):
+            enhanced_map[mid_mask] = 0.25 + 0.5 * (combined_map[mid_mask] - low_threshold) / (high_threshold - low_threshold + 1e-8)
+        
+        # 确保值范围在[0,1]内
+        enhanced_map = np.clip(enhanced_map, 0, 1)
+        
         # 2. 转换为热力图
-        heatmap = cv2.applyColorMap((combined_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        heatmap = cv2.applyColorMap((enhanced_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
         
         # 3. 叠加到原图（透明度0.4）
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img.shape[2] == 3 else img.copy()
@@ -1601,11 +1180,15 @@ class TGSRModel(SRGANModel):
             text = self.text_prompts[0]
             if text:
                 # 创建文本区域
-                text_h = 40
+                text_h = 50  # 略微增加高度以容纳更多文本
                 text_area = np.ones((text_h, w, 3), dtype=np.uint8) * 240  # 淡灰色背景
                 
+                # 修改：减小字体大小
+                font_scale_text = 0.4  # 从0.5减小到0.4
+                line_height = 16  # 行高从20减小到16
+                
                 # 将长文本分成多行
-                max_chars = w // 10  # 估计每个字符的宽度
+                max_chars = w // 8  # 估计每个字符的宽度 (从10改为8，每行可容纳更多字符)
                 if len(text) > max_chars:
                     words = text.split()
                     lines = []
@@ -1620,17 +1203,17 @@ class TGSRModel(SRGANModel):
                     
                     # 如果有多行，调整文本区域的高度
                     if len(lines) > 1:
-                        text_h = min(len(lines) * 20, 60)  # 限制最高60像素
+                        text_h = min(len(lines) * line_height + 10, 80)  # 限制最高80像素
                         text_area = np.ones((text_h, w, 3), dtype=np.uint8) * 240
                     
                     # 添加每行文本
                     for i, line in enumerate(lines):
-                        y_pos = 20 + i * 20
+                        y_pos = line_height + i * line_height
                         if y_pos < text_h - 5:
-                            cv2.putText(text_area, line, (5, y_pos), font, font_scale, (0, 0, 0), 1, cv2.LINE_AA)
+                            cv2.putText(text_area, line, (5, y_pos), font, font_scale_text, (0, 0, 0), 1, cv2.LINE_AA)
                 else:
                     # 单行文本
-                    cv2.putText(text_area, text, (5, 20), font, font_scale, (0, 0, 0), 1, cv2.LINE_AA)
+                    cv2.putText(text_area, text, (5, line_height), font, font_scale_text, (0, 0, 0), 1, cv2.LINE_AA)
                 
                 # 添加文本区域到结果图像
                 result = np.vstack([text_area, result])

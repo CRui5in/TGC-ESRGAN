@@ -26,4 +26,9 @@ echo "开始训练..." | tee -a "$LOG_FILE"
 cd $SCRIPT_DIR
 nohup python -u train.py -opt $CONFIG --launcher none --auto_resume > "$LOG_FILE" 2>&1 & 
 
+# 保存进程PID到当前目录的txt文件
+PID=$!
+echo $PID > "$SCRIPT_DIR/train_pid.txt"
+echo "训练进程PID: $PID 已保存到 $SCRIPT_DIR/train_pid.txt"
+
 echo "训练日志已保存到: $LOG_FILE"
