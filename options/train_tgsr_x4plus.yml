@@ -130,7 +130,7 @@ network_t:
   type: TextGuidanceNet
   num_feat: 64  # 与SR网络的特征通道匹配
   text_dim: 512  # CLIP文本特征维度
-  num_blocks: 3  # 文本注意力块数量
+  num_blocks: 5  # 文本注意力块数量
   num_heads: 8   # 多头注意力头数
 
 # 判别器网络
@@ -210,12 +210,12 @@ train:
 
   cri_semantic:
     type: TextSemanticConsistencyLoss
-    loss_weight: 0.5
+    loss_weight: 1.0
     reduction: mean
   
   cri_attention:
     type: TextRegionAttentionLoss
-    loss_weight: 1.0
+    loss_weight: 0.5
     reduction: mean
   
   cri_refinement:
@@ -230,7 +230,7 @@ train:
 
 # validation settings
 val:
-  val_freq: !!float 4e4  # 减少验证频率，提高训练效率
+  val_freq: !!float 1e4  # 减少验证频率，提高训练效率
   save_img: true
   save_attention_maps: true
   compare_with_unguided: true

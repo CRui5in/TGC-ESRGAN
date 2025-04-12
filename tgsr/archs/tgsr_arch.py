@@ -500,7 +500,7 @@ class EnhancedRegionAwareTextFusion(nn.Module):
         self.channels = channels
         self.text_dim = text_dim
         
-        # 新增：文本特征转换 - 多层次语义转换
+        # 文本特征转换
         self.text_transform = nn.Sequential(
             nn.Linear(text_dim, text_dim),
             nn.LayerNorm(text_dim),
@@ -509,24 +509,24 @@ class EnhancedRegionAwareTextFusion(nn.Module):
             nn.LayerNorm(text_dim)
         )
         
-        # 新增：更复杂的注意力生成网络 - 多尺度特征融合
+        # 简化并改进注意力生成网络 - 添加多尺度感知和空间感知能力
         self.attention_gen = nn.Sequential(
-            # 第一层：特征转换
+            # 降采样分支 - 捕获全局信息
             nn.Conv2d(channels + text_dim, channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
-            
-            # 第二层：中间表示
-            nn.Conv2d(channels, channels // 2, kernel_size=3, padding=1),
+            # 添加多尺度感知 - 使用空洞卷积增大感受野
+            nn.Conv2d(channels, channels // 2, kernel_size=3, padding=2, dilation=2),
             nn.BatchNorm2d(channels // 2),
             nn.ReLU(inplace=True),
-            
-            # 第三层：注意力输出
+            # 最终输出
             nn.Conv2d(channels // 2, 1, kernel_size=1)
-            # 移除Sigmoid层，让输出保持为logits形式，配合BCEWithLogitsLoss使用
         )
         
-        # 新增：多种文本调制特征
+        # 是否应用平滑处理
+        self.apply_smoothing = True
+        
+        # 文本调制特征
         self.text_modulation = nn.Sequential(
             nn.Linear(text_dim, text_dim),
             nn.LayerNorm(text_dim),
@@ -535,17 +535,17 @@ class EnhancedRegionAwareTextFusion(nn.Module):
             nn.Tanh()  # 限制在[-1,1]范围内
         )
         
-        # 新增：空间感知的文本信息注入
+        # 空间感知的文本信息注入
         self.spatial_gate = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels),
             nn.BatchNorm2d(channels),
             nn.Sigmoid()
         )
         
-        # 新增：注意力正则化 - 用于防止注意力崩塌
+        # 注意力正则化 - 用于防止注意力崩塌
         self.attn_dropout = nn.Dropout(0.1)
         
-        # 新增：残差连接门控 - 控制多少原始特征保留
+        # 残差连接门控 - 控制多少原始特征保留
         self.residual_gate = nn.Parameter(torch.ones(1) * 0.5)
         
     def forward(self, features, text_embedding):
@@ -566,6 +566,10 @@ class EnhancedRegionAwareTextFusion(nn.Module):
         # 生成注意力图
         combined_feat = torch.cat([features, text_feat_expanded], dim=1)
         attention_logits = self.attention_gen(combined_feat)  # [B, 1, H, W] - logits
+        
+        # 应用平滑处理 - 减少块状效应
+        if self.apply_smoothing:
+            attention_logits = F.avg_pool2d(attention_logits, 3, stride=1, padding=1)
         
         # 应用注意力dropout - 增加随机性，防止崩塌
         attention_logits = self.attn_dropout(attention_logits)

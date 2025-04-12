@@ -48,10 +48,6 @@ class TGSRModel(SRGANModel):
         
         # 存储注意力图
         self.attention_maps = None
-        
-        # 梯度累积设置
-        self.accumulate_grad_batches = opt.get('accumulate_grad_batches', 1)
-        self.grad_count = 0
     
     def init_training_settings(self):
         """重写init_training_settings，确保文本引导网络在setup_optimizers之前被初始化"""
@@ -410,10 +406,15 @@ class TGSRModel(SRGANModel):
             # clamp and round
             self.lq = torch.clamp((out * 255.0).round(), 0, 255) / 255.
 
-            # 随机裁剪
-            gt_size = self.opt['gt_size']
-            (self.gt, self.gt_usm), self.lq = paired_random_crop([self.gt, self.gt_usm], self.lq, gt_size,
-                                                                self.opt['scale'])
+            # 去除随机裁剪，仅确保lq尺寸为gt的1/scale
+            # 确保gt和lq尺寸匹配 (gt尺寸为scale倍的lq)
+            target_h, target_w = self.lq.size()[2:4]  # lq尺寸
+            gt_h, gt_w = target_h * self.opt['scale'], target_w * self.opt['scale']  # 期望的gt尺寸
+            
+            # 如果gt尺寸不匹配，则调整gt和gt_usm的尺寸
+            if self.gt.size(2) != gt_h or self.gt.size(3) != gt_w:
+                self.gt = F.interpolate(self.gt, size=(gt_h, gt_w), mode='bicubic')
+                self.gt_usm = F.interpolate(self.gt_usm, size=(gt_h, gt_w), mode='bicubic')
             
             # 训练数据队列
             self._dequeue_and_enqueue()
@@ -430,6 +431,13 @@ class TGSRModel(SRGANModel):
             if 'gt' in data:
                 self.gt = data['gt'].to(self.device)
                 self.gt_usm = self.usm_sharpener(self.gt)
+                
+                # 确保验证/测试时gt和lq尺寸匹配
+                if self.gt.size(2) != self.lq.size(2) * self.opt['scale'] or self.gt.size(3) != self.lq.size(3) * self.opt['scale']:
+                    target_h, target_w = self.lq.size()[2:4]
+                    gt_h, gt_w = target_h * self.opt['scale'], target_w * self.opt['scale']
+                    self.gt = F.interpolate(self.gt, size=(gt_h, gt_w), mode='bicubic')
+                    self.gt_usm = F.interpolate(self.gt_usm, size=(gt_h, gt_w), mode='bicubic')
 
     def apply_text_guidance(self, features, text_hidden=None, text_pooled=None, block_idx=None):
         """应用文本引导到特征图
@@ -498,39 +506,23 @@ class TGSRModel(SRGANModel):
         if self.use_text_features and apply_guidance and text_hidden is not None and text_pooled is not None:
             num_blocks = len(self.net_g.body)
             
-            # 改进：自适应分层引导策略 - 更多引导位置及动态引导强度
-            if num_blocks >= 20:  # 模型较大时使用5个引导点
-                # 设置引导位置 - 在不同层次均匀分布
-                guidance_positions = [
-                    num_blocks // 8,             # 浅层 - 捕获边缘和纹理
-                    num_blocks // 4,             # 浅中层 - 捕获局部特征
-                    num_blocks // 2,             # 中层 - 捕获中等规模特征
-                    num_blocks * 3 // 4,         # 中深层 - 捕获对象部件
-                    num_blocks - 2               # 深层 - 捕获整体语义
-                ]
-                
-                # 为不同层级设置引导强度 - 中间层级给予更高的权重
-                guidance_weights = {
-                    num_blocks // 8: 0.6,        # 浅层权重
-                    num_blocks // 4: 0.8,        # 浅中层
-                    num_blocks // 2: 1.0,        # 中层使用最高权重
-                    num_blocks * 3 // 4: 0.8,    # 中深层
-                    num_blocks - 2: 0.6          # 深层使用较低权重
-                }
+            # 简化：减少为3个关键引导点
+            guidance_positions = [
+                num_blocks // 6,             # 浅层 - 捕获边缘和纹理
+                num_blocks // 2,             # 中层 - 捕获中等规模特征
+                num_blocks * 5 // 6          # 深层 - 捕获整体语义
+            ]
             
-            # 验证时使用所有引导位置，训练时可选随机丢弃部分引导位置
-            if self.is_train and random.random() < 0.3:  # 30%概率随机丢弃部分引导位置
-                # 至少保留3个引导位置
-                keep_count = max(3, len(guidance_positions) - random.randint(1, 2))
-                selected_positions = sorted(random.sample(guidance_positions, keep_count))
-                guidance_positions = selected_positions
+            # 为不同层级设置引导强度
+            guidance_weights = {
+                num_blocks // 6: 0.7,        # 浅层权重
+                num_blocks // 2: 1.0,        # 中层使用最高权重
+                num_blocks * 5 // 6: 0.8     # 深层权重
+            }
             
             # 缓存特征用于损失计算
             self.original_features_cache = {}
             self.enhanced_features_cache = {}
-            
-            # 防止过拟合和注意力崩塌的随机屏蔽策略
-            apply_masking = self.is_train and random.random() < 0.3  # 30%概率在训练时应用
             
             for i, block in enumerate(self.net_g.body):
                 trunk = block(trunk)
@@ -541,20 +533,10 @@ class TGSRModel(SRGANModel):
                     if self.is_train:
                         self.original_features_cache[i] = trunk.clone()
                     
-                    # 随机特征掩码 - 防止模型过度依赖特定区域
-                    if apply_masking:
-                        b, c, h, w = trunk.shape
-                        mask = torch.rand(b, 1, h, w, device=trunk.device) > 0.2
-                        mask = mask.float().expand_as(trunk)
-                        
-                        # 应用掩码，保留80%的特征，其余置为均值
-                        mean_val = trunk.mean(dim=[2, 3], keepdim=True)
-                        trunk = trunk * mask + mean_val * (1 - mask)
-                    
-                    # 文本引导
+                    # 文本引导 - 不再应用随机掩码和随机重置
                     enhanced_features, attn_maps = self.apply_text_guidance(trunk, text_hidden, text_pooled, block_idx=i)
                     
-                    # 新增：应用引导强度权重
+                    # 应用引导强度权重
                     weight = guidance_weights.get(i, 1.0)
                     # 加权融合：原始特征 + 权重 * 增强特征
                     trunk = trunk + weight * (enhanced_features - trunk)
@@ -571,18 +553,6 @@ class TGSRModel(SRGANModel):
                         else:
                             processed_attn = torch.sigmoid(attn_maps)
                             attention_maps.append(processed_attn)
-                    
-                    # 随机重置特征 - 防止过度依赖注意力
-                    if self.is_train and random.random() < 0.1:  # 10%概率在训练时应用
-                        b, c, h, w = trunk.shape
-                        reset_mask = torch.rand(b, 1, h, w, device=trunk.device) < 0.2
-                        reset_mask = reset_mask.float().expand_as(trunk)
-                        
-                        # 保存原始特征用于重置
-                        orig_feat = self.original_features_cache[i]
-                        
-                        # 部分重置为原始特征
-                        trunk = trunk * (1 - reset_mask) + orig_feat * reset_mask
         else:
             # 不使用文本引导
             for block in self.net_g.body:
@@ -602,7 +572,7 @@ class TGSRModel(SRGANModel):
         
         # 保存注意力图
         if len(attention_maps) > 0:
-            self.attention_maps = attention_maps
+            self.attention_maps = attention_maps 
         
         return out
     
@@ -629,7 +599,17 @@ class TGSRModel(SRGANModel):
             if self.opt.get('val', {}).get('save_attention_maps', False):
                 os.makedirs(osp.join(save_path_root, 'attention'), exist_ok=True)
         
+        # 添加计数器，限制只测试前1000张图片
+        test_count = 0
+        max_test_samples = 1000
+        
         for idx, val_data in enumerate(dataloader):
+            # 检查是否已经测试了1000张图片
+            if test_count >= max_test_samples:
+                break
+            
+            test_count += 1
+            
             # 获取文本提示（如果有）
             if 'text_prompt' in val_data:
                 self.text_prompts = val_data['text_prompt']
@@ -675,11 +655,35 @@ class TGSRModel(SRGANModel):
             save_this_img = save_img and idx < 20
                 
             # 保存注意力图（如果有）
-            if save_this_img and self.opt.get('val', {}).get('save_attention_maps', False) and self.attention_maps:
+            if save_this_img and self.attention_maps:
                 attention_maps = self.get_current_attention_maps()
                 if attention_maps:
-                    # 使用GradCAM风格保存合并后的注意力图
-                    self.save_gradcam_attention(sr_img, attention_maps, img_name, save_path_root, current_iter)
+                    # 1. 使用GradCAM风格保存合并后的注意力图
+                    if self.opt.get('val', {}).get('save_attention_maps', False):
+                        attn_save_path = self.save_gradcam_attention(sr_img, attention_maps, img_name, save_path_root, current_iter)
+                    
+                    # 2. 新增：直接在输出图像上叠加注意力图
+                    # 合并所有注意力图
+                    all_maps = np.stack([attn for attn in attention_maps.values()])
+                    combined_map = np.mean(all_maps, axis=0)
+                    
+                    # 确保尺寸匹配
+                    combined_map = cv2.resize(combined_map, (sr_img.shape[1], sr_img.shape[0]), interpolation=cv2.INTER_LINEAR)
+                    
+                    # 应用CLAHE自适应直方图均衡化增强对比度
+                    combined_map_uint8 = (combined_map * 255).astype(np.uint8)
+                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                    combined_map_enhanced = clahe.apply(combined_map_uint8) / 255.0
+                    
+                    # 创建热力图
+                    heatmap = cv2.applyColorMap((combined_map_enhanced * 255).astype(np.uint8), cv2.COLORMAP_JET)
+                    
+                    # 叠加到原图上
+                    overlay_img = cv2.addWeighted(sr_img, 0.7, heatmap, 0.3, 0)
+                    
+                    # 保存叠加图
+                    overlay_save_path = osp.join(save_path_root, f'{img_name}_overlay_{current_iter}.png')
+                    imwrite(overlay_img, overlay_save_path)
             
             # 2. 可选: 测试无文本引导的结果进行对比
             if self.opt.get('val', {}).get('compare_with_unguided', False):
@@ -695,10 +699,7 @@ class TGSRModel(SRGANModel):
             # 设置回引导结果用于指标计算
             self.output = results['guided']
             
-            # 计算指标和保存图像
-            visuals = self.get_current_visuals()
-            sr_img = tensor2img([visuals['result']])
-            
+            # 保存文本提示和比较图
             if save_this_img:
                 
                 # 保存文本提示信息
@@ -823,7 +824,7 @@ class TGSRModel(SRGANModel):
         self.output = self.forward_sr_network(self.lq, apply_guidance)
 
     def optimize_parameters(self, current_iter):
-        """优化参数，整合SR网络和文本引导网络，支持梯度累积"""
+        """优化参数，整合SR网络和文本引导网络"""
         # 定期清理CUDA缓存以减少内存碎片
         if current_iter % 50 == 0:
             torch.cuda.empty_cache()
@@ -837,23 +838,10 @@ class TGSRModel(SRGANModel):
         for p in self.net_d.parameters():
             p.requires_grad = False
 
-        # 只在累积的第一个批次时清零梯度
-        if self.grad_count == 0:
-            self.optimizer_g.zero_grad()
-            if self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t'):
-                self.optimizer_t.zero_grad()
-                
-        # 新增：动态调整注意力温度 - 从高温到低温
-        # 高温使得注意力分布更均匀，低温使得注意力更加集中
-        if hasattr(self, 'net_t'):
-            total_iters = self.opt.get('train', {}).get('total_iter', 400000)
-            # 温度从1.5逐渐降低到0.5
-            temp = max(0.5, 1.5 - current_iter / total_iters)
-            
-            # 为每个带有temperature参数的模块设置温度
-            for module in self.net_t.modules():
-                if hasattr(module, 'temperature'):
-                    module.temperature = temp
+        # 清零梯度
+        self.optimizer_g.zero_grad()
+        if self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t'):
+            self.optimizer_t.zero_grad()
         
         # 前向传播，应用文本引导
         self.output = self.forward_sr_network(self.lq, apply_guidance=True)
@@ -881,8 +869,6 @@ class TGSRModel(SRGANModel):
         l_g_total += l_g_gan
         loss_dict['l_g_gan'] = l_g_gan
 
-        # 使用累积批次大小进行归一化
-        l_g_total = l_g_total / self.accumulate_grad_batches
         # 如果有文本引导网络，保留计算图以便后续的反向传播
         retain_graph = self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t')
         l_g_total.backward(retain_graph=retain_graph)
@@ -902,13 +888,21 @@ class TGSRModel(SRGANModel):
                 for pos, enhanced_feat in self.enhanced_features_cache.items():
                     l_t_semantic = self.cri_semantic(enhanced_feat, text_pooled, 
                                                    getattr(self, 'feat_proj', None))
-                    l_t_semantic = l_t_semantic / self.accumulate_grad_batches  # 归一化
                     l_t_total += l_t_semantic
                     loss_dict[f'l_t_semantic_{pos}'] = l_t_semantic
             
             # 2. 文本区域监督注意力损失
             if (hasattr(self, 'cri_attention') and hasattr(self, 'current_attention_maps') 
                 and self.current_attention_maps and objects_info is not None):
+                
+                # 新增：动态更新熵正则化权重
+                if hasattr(self.cri_attention, 'update_entropy_weight'):
+                    total_iters = self.opt.get('train', {}).get('total_iter', 400000)
+                    entropy_weight = self.cri_attention.update_entropy_weight(current_iter, total_iters)
+                    # 每1000次迭代记录一次当前熵权重
+                    if current_iter % 1000 == 0:
+                        self.logger.info(f"当前entropy_weight: {entropy_weight:.4f}")
+                
                 # 对每个位置的注意力图应用损失
                 for pos, attn_maps in self.current_attention_maps.items():
                     if isinstance(attn_maps, list) and len(attn_maps) > 0:
@@ -942,15 +936,8 @@ class TGSRModel(SRGANModel):
                         # 计算批次平均损失
                         if valid_samples > 0:
                             l_t_attn = l_t_attn_batch / valid_samples
-                            l_t_attn = l_t_attn / self.accumulate_grad_batches  # 归一化
                             l_t_total += l_t_attn
                             loss_dict[f'l_t_attn_{pos}'] = l_t_attn
-                            
-                            # 新增：如果注意力损失太大，可能表明已经崩塌，增加熵正则化权重
-                            if l_t_attn.item() > 5.0 and hasattr(self.cri_attention, 'entropy_weight'):
-                                # 动态增加熵权重，鼓励更均匀的注意力
-                                self.cri_attention.entropy_weight = min(0.3, self.cri_attention.entropy_weight * 1.2)
-                                self.logger.info(f"检测到高注意力损失，增加熵权重至:{self.cri_attention.entropy_weight:.4f}")
             
             # 3. 特征细化损失
             if (hasattr(self, 'cri_refinement') and hasattr(self, 'original_features_cache') 
@@ -962,7 +949,6 @@ class TGSRModel(SRGANModel):
                     enhanced_feat = self.enhanced_features_cache[pos]
                     l_t_refine = self.cri_refinement(orig_feat, enhanced_feat, text_pooled, 
                                                   getattr(self, 'feat_proj', None))
-                    l_t_refine = l_t_refine / self.accumulate_grad_batches  # 归一化
                     l_t_total += l_t_refine
                     loss_dict[f'l_t_refine_{pos}'] = l_t_refine
             
@@ -975,19 +961,10 @@ class TGSRModel(SRGANModel):
                 if self.is_train:
                     torch.nn.utils.clip_grad_norm_(self.net_t.parameters(), max_norm=1.0)
         
-        # 增加梯度计数
-        self.grad_count += 1
-        
-        # 当达到累积批次数时执行优化器步骤
-        if self.grad_count >= self.accumulate_grad_batches:
-            self.optimizer_g.step()
-            if self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t'):
-                self.optimizer_t.step()
-            # 执行完optimizer.step()后立即清零梯度
-            self.optimizer_g.zero_grad()
-            if self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t'):
-                self.optimizer_t.zero_grad()
-            self.grad_count = 0
+        # 执行优化器步骤
+        self.optimizer_g.step()
+        if self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t'):
+            self.optimizer_t.step()
         
         # 清理GPU内存
         if hasattr(torch.cuda, 'empty_cache'):
