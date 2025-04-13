@@ -253,22 +253,20 @@ class TGSRDataset(data.Dataset):
         # 图像增强处理 - 使用与RealESRGAN相同的方法
         img_gt = augment(img_gt, self.use_hflip, self.use_rot)
 
-        # 裁剪或填充到指定尺寸
+        # 调整到固定尺寸 - 确保输出始终是crop_pad_size x crop_pad_size
         h, w = img_gt.shape[0:2]
         crop_pad_size = self.gt_size
-        # 填充
-        if h < crop_pad_size or w < crop_pad_size:
-            pad_h = max(0, crop_pad_size - h)
-            pad_w = max(0, crop_pad_size - w)
-            img_gt = cv2.copyMakeBorder(img_gt, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT_101)
-        # 裁剪
-        if img_gt.shape[0] > crop_pad_size or img_gt.shape[1] > crop_pad_size:
-            h, w = img_gt.shape[0:2]
-            # 随机选择顶部和左侧坐标
-            top = random.randint(0, h - crop_pad_size)
-            left = random.randint(0, w - crop_pad_size)
-            img_gt = img_gt[top:top + crop_pad_size, left:left + crop_pad_size, ...]
-                
+        
+        # 如果图像尺寸与目标尺寸不同，使用缩放并确保尺寸精确匹配
+        if h != crop_pad_size or w != crop_pad_size:
+            # 使用INTER_AREA进行下采样（缩小），使用INTER_LINEAR进行上采样（放大）
+            interpolation = cv2.INTER_AREA if h > crop_pad_size or w > crop_pad_size else cv2.INTER_LINEAR
+            img_gt = cv2.resize(img_gt, (crop_pad_size, crop_pad_size), interpolation=interpolation)
+        
+        # 确保大小正确
+        assert img_gt.shape[0] == crop_pad_size and img_gt.shape[1] == crop_pad_size, \
+            f"图像尺寸错误: {img_gt.shape}, 应为: {crop_pad_size}x{crop_pad_size}"
+
         # ------------------------ Generate kernels (used in the first degradation) ------------------------ #
         kernel_size = random.choice(self.kernel_range)
         if np.random.uniform() < self.sinc_prob:

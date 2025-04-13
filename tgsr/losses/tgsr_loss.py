@@ -36,53 +36,12 @@ def decode_mask(mask_encoded):
         # 返回空掩码
         return np.zeros((1, 1), dtype=np.uint8)
 
-
-@LOSS_REGISTRY.register()
-class TextSemanticConsistencyLoss(nn.Module):
-    """
-    语义一致性损失：确保增强特征与文本语义一致
-    """
-    def __init__(self, loss_weight=1.0, reduction='mean'):
-        super(TextSemanticConsistencyLoss, self).__init__()
-        self.loss_weight = loss_weight
-        self.reduction = reduction
-        
-    def forward(self, enhanced_features, text_pooled, feat_proj=None):
-        """
-        Args:
-            enhanced_features (Tensor): 增强后的特征, shape (B, C, H, W)
-            text_pooled (Tensor): 文本池化特征, shape (B, D)
-            feat_proj (nn.Module, optional): 特征投影层
-        """
-        # 全局池化特征
-        b, c, h, w = enhanced_features.size()
-        pooled_features = F.adaptive_avg_pool2d(enhanced_features, (1, 1)).view(b, c)
-        
-        # 如果需要，投影到相同维度
-        if feat_proj is not None:
-            pooled_features = feat_proj(pooled_features)
-        
-        # 计算余弦相似度
-        sim = F.cosine_similarity(pooled_features, text_pooled, dim=1)
-        
-        # 计算损失：最大化相似度，所以使用 1-sim
-        loss = 1.0 - sim
-        
-        # 应用reduction
-        if self.reduction == 'mean':
-            loss = loss.mean()
-        elif self.reduction == 'sum':
-            loss = loss.sum()
-            
-        return self.loss_weight * loss
-
-
 @LOSS_REGISTRY.register()
 class TextRegionAttentionLoss(nn.Module):
     """
     简化版文本区域监督注意力损失：直接使用整合后的注意力图和掩码
     """
-    def __init__(self, loss_weight=1.0, reduction='mean', entropy_weight=0.01, diversity_weight=0.02):
+    def __init__(self, loss_weight=1.0, reduction='mean', entropy_weight=0.05):
         super(TextRegionAttentionLoss, self).__init__()
         self.loss_weight = loss_weight
         self.reduction = reduction
@@ -91,7 +50,7 @@ class TextRegionAttentionLoss(nn.Module):
         # 熵正则化和多样性权重
         self.entropy_weight = entropy_weight
         self.initial_entropy_weight = entropy_weight
-        self.target_entropy_weight = 0.05
+        self.target_entropy_weight = 0.1
         
     def resize_mask(self, mask, target_size):
         """调整掩码大小，使用bilinear插值获得更平滑的边缘"""
@@ -199,56 +158,123 @@ class TextRegionAttentionLoss(nn.Module):
 
 
 @LOSS_REGISTRY.register()
-class FeatureRefinementLoss(nn.Module):
+class ControlFeatureLoss(nn.Module):
+    """控制特征损失：确保控制特征与文本描述和对象掩码对齐
+    适用于ControlNet风格的模型架构
     """
-    特征细化损失：确保增强过程是有效的，即增强后的特征比原始特征更接近文本语义
-    """
-    def __init__(self, loss_weight=1.0, margin=0.1, stability_weight=0.1, reduction='mean'):
-        super(FeatureRefinementLoss, self).__init__()
+    def __init__(self, loss_weight=1.0, reduction='mean'):
+        super(ControlFeatureLoss, self).__init__()
         self.loss_weight = loss_weight
-        self.margin = margin
-        self.stability_weight = stability_weight
         self.reduction = reduction
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
         
-    def forward(self, original_features, enhanced_features, text_pooled, feat_proj=None):
+    def forward(self, control_features, attention_maps, text_pooled, objects_info=None, device=None):
         """
+        计算控制特征损失
+        
         Args:
-            original_features (Tensor): 原始特征，shape (B, C, H, W)
-            enhanced_features (Tensor): 增强后的特征，shape (B, C, H, W)
-            text_pooled (Tensor): 文本池化特征，shape (B, D)
-            feat_proj (nn.Module, optional): 特征投影层
+            control_features (Tensor): 控制特征
+            attention_maps (list): 注意力图列表
+            text_pooled (Tensor): 文本池化特征
+            objects_info (list): 对象信息列表
+            device (torch.device): 设备
         """
-        batch_size = original_features.size(0)
+        batch_size = text_pooled.size(0)
+        device = control_features.device if device is None else device
         
-        # 全局池化特征
-        orig_pooled = F.adaptive_avg_pool2d(original_features, (1, 1)).view(batch_size, -1)
-        enhanced_pooled = F.adaptive_avg_pool2d(enhanced_features, (1, 1)).view(batch_size, -1)
+        # 1. 语义一致性损失 - 确保控制特征与文本语义一致
+        pooled_features = F.adaptive_avg_pool2d(control_features, (1, 1)).view(batch_size, -1)
         
-        # 如果需要，投影到相同维度
-        if feat_proj is not None:
-            orig_pooled = feat_proj(orig_pooled)
-            enhanced_pooled = feat_proj(enhanced_pooled)
+        # 统一维度
+        if pooled_features.size(1) != text_pooled.size(1):
+            # 简单线性投影
+            projection = nn.Linear(pooled_features.size(1), text_pooled.size(1), device=device)
+            pooled_features = projection(pooled_features)
         
-        # 计算与文本特征的相似度
-        orig_sim = F.cosine_similarity(orig_pooled, text_pooled, dim=1)
-        enhanced_sim = F.cosine_similarity(enhanced_pooled, text_pooled, dim=1)
+        # 计算余弦相似度损失
+        similarity = F.cosine_similarity(pooled_features, text_pooled, dim=1)
+        semantic_loss = 1.0 - similarity.mean()
         
-        # 计算提升损失：确保增强后的相似度更高
-        # 使用ReLU确保仅在原始相似度高于增强相似度时有损失
-        improvement_loss = F.relu(orig_sim - enhanced_sim + self.margin)
-        
-        # 稳定性损失：确保增强前后的特征不会相差太大
-        stability_loss = F.mse_loss(enhanced_features, original_features, reduction='none')
-        
-        # 应用reduction
-        if self.reduction == 'mean':
-            improvement_loss = improvement_loss.mean()
-            stability_loss = stability_loss.mean()
-        elif self.reduction == 'sum':
-            improvement_loss = improvement_loss.sum()
-            stability_loss = stability_loss.sum()
+        # 2. 注意力一致性损失 - 确保注意力图与对象掩码一致
+        attention_loss = torch.tensor(0.0, device=device)
+        if objects_info is not None and len(attention_maps) > 0:
+            valid_samples = 0
             
-        # 组合损失
-        total_loss = improvement_loss + self.stability_weight * stability_loss
+            # 使用最后一个注意力图（通常最精细）
+            attn_logits = attention_maps[-1]
+            
+            # 逐样本处理
+            for i in range(batch_size):
+                if i >= len(objects_info) or not objects_info[i]:
+                    continue
+                    
+                objects = objects_info[i]
+                h, w = attn_logits[i].shape[-2:]
+                
+                # 创建目标掩码
+                target_mask = torch.zeros((1, h, w), device=device)
+                has_objects = False
+                
+                # 整合对象掩码
+                for obj in objects:
+                    if 'mask_encoded' in obj:
+                        try:
+                            # 解码掩码并调整大小
+                            obj_mask = decode_mask(obj['mask_encoded'])
+                            if obj_mask is not None and obj_mask.sum() > 0:
+                                has_objects = True
+                                # 调整掩码大小并合并
+                                obj_mask_tensor = torch.from_numpy(obj_mask).float().to(device)
+                                obj_mask_tensor = F.interpolate(
+                                    obj_mask_tensor.unsqueeze(0).unsqueeze(0), 
+                                    size=(h, w), 
+                                    mode='bilinear', 
+                                    align_corners=False
+                                )
+                                target_mask = torch.max(target_mask, obj_mask_tensor[0])
+                        except Exception:
+                            continue
+                
+                if has_objects:
+                    # 计算BCE损失
+                    sample_attn = attn_logits[i:i+1]
+                    sample_loss = self.bce_loss(sample_attn, target_mask.unsqueeze(0))
+                    attention_loss += sample_loss.mean()
+                    valid_samples += 1
+            
+            if valid_samples > 0:
+                attention_loss = attention_loss / valid_samples
+        
+        # 3. 边界平滑损失 - 鼓励注意力图平滑变化
+        smoothness_loss = torch.tensor(0.0, device=device)
+        if len(attention_maps) > 0:
+            attn = torch.sigmoid(attention_maps[-1])
+            # 计算水平和垂直梯度
+            h_gradient = torch.abs(attn[:, :, :, :-1] - attn[:, :, :, 1:])
+            v_gradient = torch.abs(attn[:, :, :-1, :] - attn[:, :, 1:, :])
+            
+            # 对大梯度区域进行惩罚
+            gradient_threshold = 0.1
+            h_penalty = F.relu(h_gradient - gradient_threshold).mean()
+            v_penalty = F.relu(v_gradient - gradient_threshold).mean()
+            
+            smoothness_loss = (h_penalty + v_penalty) * 0.5
+        
+        # 4. 熵正则化损失 - 防止注意力崩塌或过度扩散
+        entropy_loss = torch.tensor(0.0, device=device)
+        if len(attention_maps) > 0:
+            attn = torch.sigmoid(attention_maps[-1])
+            eps = 1e-7
+            attn_clipped = torch.clamp(attn, min=eps, max=1.0-eps)
+            
+            # 二元熵: -p*log(p) - (1-p)*log(1-p)
+            entropy = -attn_clipped * torch.log(attn_clipped) - (1-attn_clipped) * torch.log(1-attn_clipped)
+            
+            # 熵过高或过低都不理想
+            target_entropy = 0.3  # 适中的熵值
+            entropy_loss = F.mse_loss(entropy.mean(), torch.tensor(target_entropy, device=device))
+        
+        # 组合所有损失，权重可调
+        total_loss = semantic_loss + attention_loss * 0.5 + smoothness_loss * 0.2 + entropy_loss * 0.3
         
         return self.loss_weight * total_loss 

@@ -12,23 +12,23 @@ percep_gt_usm: True
 gan_gt_usm: False
 
 # the first degradation process
-resize_prob: [0.2, 0.7, 0.1]  # up, down, keep
-resize_range: [0.15, 1.5]
-gaussian_noise_prob: 0.5
-noise_range: [1, 30]
-poisson_scale_range: [0.05, 3]
-gray_noise_prob: 0.4
-jpeg_range: [30, 95]
+resize_prob: [0.3, 0.4, 0.3]  # up, down, keep - 增加保持原尺寸的概率
+resize_range: [0.3, 1.3]  # 缩小尺度范围，减少极端情况
+gaussian_noise_prob: 0.4  # 降低高斯噪声概率
+noise_range: [1, 20]  # 降低噪声上限
+poisson_scale_range: [0.05, 2.0]  # 降低泊松噪声尺度
+gray_noise_prob: 0.3  # 降低灰度噪声概率
+jpeg_range: [40, 95]  # 提高JPEG压缩下限，减少过度压缩
 
 # the second degradation process
-second_blur_prob: 0.8
-resize_prob2: [0.3, 0.4, 0.3]  # up, down, keep
-resize_range2: [0.3, 1.2]
-gaussian_noise_prob2: 0.5
-noise_range2: [1, 25]
-poisson_scale_range2: [0.05, 2.5]
-gray_noise_prob2: 0.4
-jpeg_range2: [30, 95]
+second_blur_prob: 0.6  # 降低二次模糊概率
+resize_prob2: [0.3, 0.4, 0.3]  # up, down, keep - 增加保持原尺寸的概率
+resize_range2: [0.4, 1.0]  # 缩小尺度范围
+gaussian_noise_prob2: 0.4  # 降低高斯噪声概率
+noise_range2: [1, 15]  # 大幅降低噪声上限
+poisson_scale_range2: [0.05, 1.8]  # 降低泊松噪声尺度
+gray_noise_prob2: 0.3  # 降低灰度噪声概率
+jpeg_range2: [45, 95]  # 提高JPEG压缩下限
 
 
 gt_size: 256
@@ -52,42 +52,23 @@ datasets:
     io_backend:
       type: disk
 
-    blur_kernel_size: 21
+    blur_kernel_size: 17  # 减小模糊核大小
     kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
     kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
     sinc_prob: 0.1
-    blur_sigma: [0.2, 3]
-    betag_range: [0.5, 4]
-    betap_range: [1, 2]
+    blur_sigma: [0.2, 2.0]  # 降低模糊上限
+    betag_range: [0.5, 3.5]  # 降低广义高斯beta参数
+    betap_range: [1, 1.8]  # 降低高原beta参数
 
-    blur_kernel_size2: 21
+    blur_kernel_size2: 17  # 减小第二次模糊核大小
     kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
     kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
     sinc_prob2: 0.1
-    blur_sigma2: [0.2, 1.5]
-    betag_range2: [0.5, 4]
-    betap_range2: [1, 2]
+    blur_sigma2: [0.2, 1.0]  # 降低第二次模糊上限
+    betag_range2: [0.5, 3.5]  # 降低广义高斯beta参数
+    betap_range2: [1, 1.8]  # 降低高原beta参数
 
-    final_sinc_prob: 0.8
-
-    
-    # ----------------- 文本区域特定退化参数 ----------------- #
-    # use_targeted_degradation: true
-    # # 模糊参数 - 文本区域使用较轻的模糊效果
-    # text_blur:
-    #   kernel_size: 11       # 文本区域模糊核大小，较小的核尺寸产生更轻微的模糊
-    #   center_weight: 0.7    # 中心点权重，原值3.0导致图像过亮，现降至0.7保持轻度模糊效果
-    #   surround_weight: 0.003 # 周围点权重，调整为使卷积核总和约为1.0 (0.7 + 120*0.0025 ≈ 1.0)
-
-    # # 噪声参数 - 文本区域使用较轻的噪声
-    # text_noise:
-    #   strength_factor: 0.5  # 文本区域噪声强度因子，相对于非文本区域（值越小噪声越轻）
-
-    # # JPEG压缩参数 - 文本区域使用较高的质量
-    # text_jpeg:
-    #   quality_min_factor: 2.5  # 文本区域最小JPEG质量提升因子（值越大质量越高）
-    #   quality_max_factor: 1.2  # 文本区域最大JPEG质量提升因子
-    #   quality_max: 95          # 文本区域JPEG质量上限，避免超过100
+    final_sinc_prob: 0.6  # 降低最终sinc滤波概率
 
     gt_size: 256
     use_hflip: True
@@ -125,13 +106,14 @@ network_g:
   num_grow_ch: 32
   scale: 4
 
-# 文本引导网络 - 独立模块
+# 文本引导网络 - 使用ControlNet风格
 network_t:
   type: TextGuidanceNet
-  num_feat: 64  # 与SR网络的特征通道匹配
-  text_dim: 512  # CLIP文本特征维度
-  num_blocks: 5  # 文本注意力块数量
-  num_heads: 8   # 多头注意力头数
+  num_feat: 64
+  text_dim: 512
+  num_blocks: 6
+  num_heads: 8
+  with_position: false
 
 # 判别器网络
 network_d:
@@ -152,6 +134,23 @@ path:
 # training settings
 train:
   ema_decay: 0.999
+  
+  # 分阶段训练
+  stage_train: true
+  stages:
+    - name: "warmup"  # 第一阶段：先训练文本引导网络
+      iters: 15000
+      freeze_modules: ["net_g"]
+      lr_g: !!float 1e-5
+      lr_d: !!float 5e-5
+      lr_t: !!float 1e-4
+    - name: "joint"   # 第二阶段：联合训练
+      iters: 385000
+      freeze_modules: []
+      lr_g: !!float 1e-4
+      lr_d: !!float 1e-4
+      lr_t: !!float 1e-4
+  
   optim_g:
     type: Adam
     lr: !!float 1e-4
@@ -174,7 +173,7 @@ train:
     gamma: 0.5
 
   total_iter: 400000
-  warmup_iter: -1  # no warm up
+  warmup_iter: 1000  # 使用warmup
 
   # losses
   pixel_opt:
@@ -207,22 +206,16 @@ train:
 
   net_d_iters: 1
   net_d_init_iters: 0
-
-  cri_semantic:
-    type: TextSemanticConsistencyLoss
-    loss_weight: 1.0
-    reduction: mean
   
   cri_attention:
     type: TextRegionAttentionLoss
     loss_weight: 0.5
     reduction: mean
   
-  cri_refinement:
-    type: FeatureRefinementLoss
-    loss_weight: 0.5
-    margin: 0.1
-    stability_weight: 0.05
+  # ControlNet风格的控制特征损失
+  cri_control:
+    type: ControlFeatureLoss
+    loss_weight: 1.0
     reduction: mean
 
   # 特征维度，用于特征投影
@@ -230,7 +223,7 @@ train:
 
 # validation settings
 val:
-  val_freq: !!float 1e4  # 减少验证频率，提高训练效率
+  val_freq: !!float 5e3  # 减少验证频率，提高训练效率
   save_img: true
   save_attention_maps: true
   compare_with_unguided: true

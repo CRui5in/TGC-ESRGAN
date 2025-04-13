@@ -136,23 +136,15 @@ class TGSRModel(SRGANModel):
         logger = get_root_logger()
         train_opt = self.opt['train']
         
-        # 1. 语义一致性损失
-        if 'cri_semantic' in train_opt:
-            cri_semantic_opt = train_opt['cri_semantic']
-            self.cri_semantic = build_loss(cri_semantic_opt).to(self.device)
-            logger.info(f'初始化语义一致性损失: {cri_semantic_opt["type"]}')
+        if 'cri_control' in train_opt:
+            cri_control_opt = train_opt['cri_control']
+            self.cri_control = build_loss(cri_control_opt).to(self.device)
+            logger.info(f'初始化控制特征损失: {cri_control_opt["type"]}')
         
-        # 2. 文本区域监督注意力损失
-        if 'cri_attention' in train_opt:
-            cri_attention_opt = train_opt['cri_attention']
-            self.cri_attention = build_loss(cri_attention_opt).to(self.device)
-            logger.info(f'初始化文本区域监督注意力损失: {cri_attention_opt["type"]}')
-        
-        # 3. 特征细化损失
-        if 'cri_refinement' in train_opt:
-            cri_refinement_opt = train_opt['cri_refinement']
-            self.cri_refinement = build_loss(cri_refinement_opt).to(self.device)
-            logger.info(f'初始化特征细化损失: {cri_refinement_opt["type"]}')
+        # if 'cri_attention' in train_opt:
+        #     cri_attention_opt = train_opt['cri_attention']
+        #     self.cri_attention = build_loss(cri_attention_opt).to(self.device)
+        #     logger.info(f'初始化文本区域监督注意力损失: {cri_attention_opt["type"]}')
         
         # 特征投影层，用于投影特征到文本空间维度
         if hasattr(self, 'text_dim'):
@@ -479,7 +471,7 @@ class TGSRModel(SRGANModel):
         return enhanced_features, attention_logits
     
     def forward_sr_network(self, x, apply_guidance=True):
-        """SR网络的前向传播，在关键位置应用文本引导
+        """SR网络的前向传播，使用ControlNet风格的文本引导
         
         Args:
             x: 输入的低质量图像
@@ -488,91 +480,101 @@ class TGSRModel(SRGANModel):
         Returns:
             sr: 超分辨率输出
         """
-        # 编码文本（如果需要）
+        # 获取文本特征（如果需要）
         if self.use_text_features and apply_guidance and hasattr(self, 'net_t'):
             with torch.no_grad() if self.freeze_text_encoder else torch.enable_grad():
                 text_hidden, text_pooled = self.encode_text(self.text_prompts)
         else:
             text_hidden, text_pooled = None, None
+            
+        # 如果不使用文本引导，直接使用原始SR网络
+        if not self.use_text_features or not apply_guidance or text_hidden is None:
+            return self.net_g(x)
         
-        # 浅层特征提取
+        # ====================== ControlNet风格的前向传播 ======================
+        # 1. 锁定的前向传播（ControlNet的Locked Copy概念）
+        with torch.no_grad():
+            # 浅层特征提取
+            locked_fea = self.net_g.conv_first(x)
+            
+            # 分组处理RRDB块，便于更粗粒度的引导
+            locked_features = []
+            locked_trunk = locked_fea
+            
+            # RRDB块分组（每4个为一组）
+            block_groups = []
+            total_blocks = len(self.net_g.body)
+            group_size = 4  # 可根据总块数调整
+            
+            for i in range(0, total_blocks, group_size):
+                end = min(i + group_size, total_blocks)
+                block_groups.append(self.net_g.body[i:end])
+            
+            # 处理每个块组
+            for group in block_groups:
+                for block in group:
+                    locked_trunk = block(locked_trunk)
+                locked_features.append(locked_trunk.clone())
+            
+            # 主干结束的特征
+            locked_body_out = self.net_g.conv_body(locked_trunk)
+            locked_features.append(locked_body_out)
+            
+            # 上采样和最终输出的特征
+            locked_up1 = self.net_g.conv_up1(F.interpolate(locked_body_out + locked_fea, scale_factor=2, mode='nearest'))
+            locked_up2 = self.net_g.conv_up2(F.interpolate(locked_up1, scale_factor=2, mode='nearest'))
+            
+        # 2. 使用文本引导网络生成控制信号 - ControlNet的核心思想
+        # 准备空间上的文本控制
+        guided_features, attention_maps = self.net_t(locked_features[0], text_hidden, text_pooled)
+        
+        # 3. 应用控制信号和特征融合 
+        # 注：与ControlNet类似，这里我们从锁定特征开始，逐步应用控制
         fea = self.net_g.conv_first(x)
-        
-        # 主干处理
         trunk = fea
-        attention_maps = []
         
-        # 确定在哪些位置应用文本引导
-        if self.use_text_features and apply_guidance and text_hidden is not None and text_pooled is not None:
-            num_blocks = len(self.net_g.body)
-            
-            # 简化：减少为3个关键引导点
-            guidance_positions = [
-                num_blocks // 6,             # 浅层 - 捕获边缘和纹理
-                num_blocks // 2,             # 中层 - 捕获中等规模特征
-                num_blocks * 5 // 6          # 深层 - 捕获整体语义
-            ]
-            
-            # 为不同层级设置引导强度
-            guidance_weights = {
-                num_blocks // 6: 0.7,        # 浅层权重
-                num_blocks // 2: 1.0,        # 中层使用最高权重
-                num_blocks * 5 // 6: 0.8     # 深层权重
-            }
-            
-            # 缓存特征用于损失计算
-            self.original_features_cache = {}
-            self.enhanced_features_cache = {}
-            
-            for i, block in enumerate(self.net_g.body):
+        # 处理主干
+        num_groups = len(block_groups)
+        for i, group in enumerate(block_groups):
+            # 处理每个块
+            for block in group:
                 trunk = block(trunk)
+            
+            # 在每个组结束后应用控制 - 如果有足够的控制特征
+            if i < len(attention_maps):
+                # 获取当前注意力图和控制强度
+                attn = torch.sigmoid(attention_maps[i])
+                # 自适应强度控制 - 训练开始时较低，随着训练进行逐渐增强
+                if self.is_train:
+                    # 计算训练进度调整强度
+                    if hasattr(self, 'opt') and 'train' in self.opt:
+                        total_iter = self.opt['train'].get('total_iter', 400000)
+                        if hasattr(self, 'total_iter'):
+                            total_iter = self.total_iter
+                        progress = min(1.0, self.iter / total_iter) if hasattr(self, 'iter') else 0.5
+                        control_strength = 0.1 + 0.9 * progress  # 从0.1逐渐增加到1.0
+                    else:
+                        control_strength = 0.5
+                else:
+                    control_strength = 1.0  # 测试时使用全强度
                 
-                # 在指定位置应用文本引导
-                if i in guidance_positions:
-                    # 缓存原始特征用于损失计算
-                    if self.is_train:
-                        self.original_features_cache[i] = trunk.clone()
-                    
-                    # 文本引导 - 不再应用随机掩码和随机重置
-                    enhanced_features, attn_maps = self.apply_text_guidance(trunk, text_hidden, text_pooled, block_idx=i)
-                    
-                    # 应用引导强度权重
-                    weight = guidance_weights.get(i, 1.0)
-                    # 加权融合：原始特征 + 权重 * 增强特征
-                    trunk = trunk + weight * (enhanced_features - trunk)
-                    
-                    # 缓存增强后的特征
-                    if self.is_train:
-                        self.enhanced_features_cache[i] = trunk.clone()
-                    
-                    # 保存注意力图
-                    if attn_maps is not None and (not self.is_train or getattr(self, 'save_attention', False)):
-                        if isinstance(attn_maps, list):
-                            processed_attn_maps = [torch.sigmoid(logits) for logits in attn_maps if logits is not None]
-                            attention_maps.extend(processed_attn_maps)
-                        else:
-                            processed_attn = torch.sigmoid(attn_maps)
-                            attention_maps.append(processed_attn)
-        else:
-            # 不使用文本引导
-            for block in self.net_g.body:
-                trunk = block(trunk)
+                # 应用控制 - trunk是变化的特征，locked_features[i]是锁定的参考特征
+                # guided_features提供从锁定特征到修改后特征的映射
+                control_signal = guided_features - locked_features[i]
+                trunk = trunk + control_strength * control_signal * attn
         
-        # 残差连接
+        # 处理主干结束
         trunk = self.net_g.conv_body(trunk)
         fea = fea + trunk
         
-        # 上采样
+        # 上采样和最终输出
         fea = self.net_g.conv_up1(F.interpolate(fea, scale_factor=2, mode='nearest'))
         fea = self.net_g.conv_up2(F.interpolate(fea, scale_factor=2, mode='nearest'))
-        
-        # 最终输出
         out = self.net_g.conv_hr(fea)
         out = self.net_g.conv_last(out)
         
-        # 保存注意力图
-        if len(attention_maps) > 0:
-            self.attention_maps = attention_maps 
+        # 保存注意力图用于可视化
+        self.attention_maps = attention_maps
         
         return out
     
@@ -825,6 +827,9 @@ class TGSRModel(SRGANModel):
 
     def optimize_parameters(self, current_iter):
         """优化参数，整合SR网络和文本引导网络"""
+        # 保存当前迭代次数
+        self.iter = current_iter
+        
         # 定期清理CUDA缓存以减少内存碎片
         if current_iter % 50 == 0:
             torch.cuda.empty_cache()
@@ -869,11 +874,30 @@ class TGSRModel(SRGANModel):
         l_g_total += l_g_gan
         loss_dict['l_g_gan'] = l_g_gan
 
+        # 文本控制网络损失
+        if hasattr(self, 'cri_control') and self.use_text_features and hasattr(self, 'attention_maps'):
+            # 获取文本特征
+            text_hidden, text_pooled = self.encode_text(self.text_prompts)
+            
+            # 获取控制特征和注意力图 - 在前向传播中已生成
+            attention_maps = self.attention_maps
+            
+            # 获取控制特征 - 这里简化为使用第一个特征，在实际应用中可能需要更复杂的逻辑
+            if hasattr(self, 'net_g') and hasattr(self.net_g, 'conv_first'):
+                with torch.no_grad():
+                    control_features = self.net_g.conv_first(self.lq)
+            
+            # 计算控制特征损失
+            objects_info = self.objects_info if hasattr(self, 'objects_info') else None
+            l_control = self.cri_control(control_features, attention_maps, text_pooled, objects_info, self.device)
+            l_g_total += l_control
+            loss_dict['l_control'] = l_control
+
         # 如果有文本引导网络，保留计算图以便后续的反向传播
         retain_graph = self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t')
         l_g_total.backward(retain_graph=retain_graph)
         
-        # 文本引导网络损失
+        # 文本引导网络损失 - 原有的语义一致性损失等
         l_t_total = 0
         if self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t'):
             # 获取文本特征和对象信息
@@ -882,82 +906,47 @@ class TGSRModel(SRGANModel):
             if hasattr(self, 'objects_info'):
                 objects_info = self.objects_info
             
-            # 1. 语义一致性损失
-            if hasattr(self, 'cri_semantic') and hasattr(self, 'enhanced_features_cache') and self.enhanced_features_cache:
-                # 对每个位置的增强特征应用损失
-                for pos, enhanced_feat in self.enhanced_features_cache.items():
-                    l_t_semantic = self.cri_semantic(enhanced_feat, text_pooled, 
-                                                   getattr(self, 'feat_proj', None))
-                    l_t_total += l_t_semantic
-                    loss_dict[f'l_t_semantic_{pos}'] = l_t_semantic
+            # ControlNet架构不再使用以下缓存
+            # 1. 注意力损失
+            if hasattr(self, 'cri_attention') and hasattr(self, 'attention_maps') and objects_info is not None:
+                # 使用注意力图直接计算损失，而不是缓存的attention_maps
+                if len(self.attention_maps) > 0:
+                    # 使用最后一个注意力图
+                    attn_logits = self.attention_maps[-1]
+                    
+                    # 动态更新熵正则化权重
+                    if hasattr(self.cri_attention, 'update_entropy_weight'):
+                        total_iters = self.opt.get('train', {}).get('total_iter', 400000)
+                        entropy_weight = self.cri_attention.update_entropy_weight(current_iter, total_iters)
+                    
+                    # 计算注意力损失
+                    l_t_attn = self.cri_attention(attn_logits, self.text_prompts, objects_info, self.device)
+                    l_t_total += l_t_attn
+                    loss_dict['l_t_attn'] = l_t_attn
             
-            # 2. 文本区域监督注意力损失
-            if (hasattr(self, 'cri_attention') and hasattr(self, 'current_attention_maps') 
-                and self.current_attention_maps and objects_info is not None):
+            # 特征平滑性损失 - 防止特征过于剧烈变化
+            if hasattr(self, 'attention_maps') and len(self.attention_maps) > 0:
+                # 计算空间平滑性
+                attention = torch.sigmoid(self.attention_maps[-1])
                 
-                # 新增：动态更新熵正则化权重
-                if hasattr(self.cri_attention, 'update_entropy_weight'):
-                    total_iters = self.opt.get('train', {}).get('total_iter', 400000)
-                    entropy_weight = self.cri_attention.update_entropy_weight(current_iter, total_iters)
-                    # 每1000次迭代记录一次当前熵权重
-                    if current_iter % 1000 == 0:
-                        self.logger.info(f"当前entropy_weight: {entropy_weight:.4f}")
+                # 水平和垂直梯度
+                h_grad = torch.abs(attention[:, :, :, :-1] - attention[:, :, :, 1:]).mean()
+                v_grad = torch.abs(attention[:, :, :-1, :] - attention[:, :, 1:, :]).mean()
                 
-                # 对每个位置的注意力图应用损失
-                for pos, attn_maps in self.current_attention_maps.items():
-                    if isinstance(attn_maps, list) and len(attn_maps) > 0:
-                        # 使用最后一个注意力图（通常最精细）- 现在是logits形式
-                        attn_logits = attn_maps[-1]
-                        
-                        # 使用逐样本处理方式处理objects_info
-                        batch_size = attn_logits.size(0)
-                        l_t_attn_batch = 0
-                        valid_samples = 0
-                        
-                        for i in range(batch_size):
-                            # 获取当前样本的文本提示和对象信息
-                            sample_text = [self.text_prompts[i]]
-                            sample_objects = [objects_info[i]] if i < len(objects_info) else [[]]
-                            sample_attn_logits = attn_logits[i:i+1]
-                            
-                            # 对单个样本进行处理 - 传入logits而非sigmoid后的结果
-                            try:
-                                # 注意：cri_attention现在接收logits
-                                sample_loss = self.cri_attention(sample_attn_logits, sample_text, sample_objects, self.device)
-                                
-                                # 只有当样本损失有效时才累加
-                                if sample_loss.item() > 0:
-                                    l_t_attn_batch += sample_loss
-                                    valid_samples += 1
-                            except Exception as e:
-                                self.logger.warning(f"注意力损失计算失败: {e}")
-                                continue
-                        
-                        # 计算批次平均损失
-                        if valid_samples > 0:
-                            l_t_attn = l_t_attn_batch / valid_samples
-                            l_t_total += l_t_attn
-                            loss_dict[f'l_t_attn_{pos}'] = l_t_attn
-            
-            # 3. 特征细化损失
-            if (hasattr(self, 'cri_refinement') and hasattr(self, 'original_features_cache') 
-                and hasattr(self, 'enhanced_features_cache')):
-                # 确保两个缓存包含相同的位置
-                common_positions = set(self.original_features_cache.keys()) & set(self.enhanced_features_cache.keys())
-                for pos in common_positions:
-                    orig_feat = self.original_features_cache[pos]
-                    enhanced_feat = self.enhanced_features_cache[pos]
-                    l_t_refine = self.cri_refinement(orig_feat, enhanced_feat, text_pooled, 
-                                                  getattr(self, 'feat_proj', None))
-                    l_t_total += l_t_refine
-                    loss_dict[f'l_t_refine_{pos}'] = l_t_refine
+                # 总梯度惩罚
+                smoothness = (h_grad + v_grad) * 0.5
+                smoothness_weight = 0.1  # 可调
+                
+                l_t_smooth = smoothness * smoothness_weight
+                l_t_total += l_t_smooth
+                loss_dict['l_t_smooth'] = l_t_smooth
             
             # 记录文本引导损失总和并反向传播
             if l_t_total > 0:
                 loss_dict['l_t_total'] = l_t_total
                 l_t_total.backward()
                 
-                # 新增：梯度裁剪，防止梯度爆炸
+                # 梯度裁剪，防止梯度爆炸
                 if self.is_train:
                     torch.nn.utils.clip_grad_norm_(self.net_t.parameters(), max_norm=1.0)
         
@@ -1001,14 +990,6 @@ class TGSRModel(SRGANModel):
         # 更新EMA模型
         if self.ema_decay > 0:
             self.model_ema(decay=self.ema_decay)
-        
-        # 清理缓存的特征和注意力图
-        if hasattr(self, 'current_attention_maps'):
-            self.current_attention_maps = {}
-        if hasattr(self, 'original_features_cache'):
-            self.original_features_cache = {}
-        if hasattr(self, 'enhanced_features_cache'):
-            self.enhanced_features_cache = {}
     
     def get_current_attention_maps(self):
         """获取当前注意力图，用于可视化"""
