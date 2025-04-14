@@ -71,7 +71,7 @@ datasets:
     final_sinc_prob: 0.6  # 降低最终sinc滤波概率
 
     gt_size: 256
-    use_hflip: True
+    use_hflip: False
     use_rot: False
 
     # data loader
@@ -139,13 +139,13 @@ train:
   stage_train: true
   stages:
     - name: "warmup"  # 第一阶段：先训练文本引导网络
-      iters: 15000
+      iters: 80000
       freeze_modules: ["net_g"]
       lr_g: !!float 1e-5
       lr_d: !!float 5e-5
       lr_t: !!float 1e-4
     - name: "joint"   # 第二阶段：联合训练
-      iters: 385000
+      iters: 320000
       freeze_modules: []
       lr_g: !!float 1e-4
       lr_d: !!float 1e-4

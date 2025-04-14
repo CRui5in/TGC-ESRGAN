@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from basicsr.utils.registry import LOSS_REGISTRY
 from pycocotools import mask as mask_util
 import numpy as np
+import os
+import cv2
 
 
 def decode_mask(mask_encoded):
@@ -39,7 +41,7 @@ def decode_mask(mask_encoded):
 @LOSS_REGISTRY.register()
 class TextRegionAttentionLoss(nn.Module):
     """
-    简化版文本区域监督注意力损失：直接使用整合后的注意力图和掩码
+    简化版文本区域监督注意力损失：直接使用注意力图和文本掩码
     """
     def __init__(self, loss_weight=1.0, reduction='mean', entropy_weight=0.05):
         super(TextRegionAttentionLoss, self).__init__()
@@ -47,112 +49,70 @@ class TextRegionAttentionLoss(nn.Module):
         self.reduction = reduction
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
         
-        # 熵正则化和多样性权重
+        # 使用固定熵权重
         self.entropy_weight = entropy_weight
-        self.initial_entropy_weight = entropy_weight
-        self.target_entropy_weight = 0.1
         
-    def resize_mask(self, mask, target_size):
-        """调整掩码大小，使用bilinear插值获得更平滑的边缘"""
-        if isinstance(mask, np.ndarray):
-            mask = torch.from_numpy(mask).float()
-        
-        if len(mask.shape) == 2:
-            mask = mask.unsqueeze(0).unsqueeze(0)
-        elif len(mask.shape) == 3:
-            mask = mask.unsqueeze(1)
+    def forward(self, attention_logits, text_masks):
+        """改进版TextRegionAttentionLoss，增加数值稳定性"""
+        if attention_logits is None or text_masks is None:
+            return None
             
-        # 使用双线性插值获得更平滑的结果
-        return F.interpolate(mask, size=target_size, mode='bilinear', align_corners=False)
-    
-    def entropy_regularization(self, attention_map):
-        """计算注意力图的熵，鼓励注意力分布更均匀"""
-        attention_prob = torch.sigmoid(attention_map)
+        # 确保输入形状匹配
+        if attention_logits.shape[-2:] != text_masks.shape[-2:]:
+            text_masks = F.interpolate(text_masks, size=attention_logits.shape[-2:], 
+                                      mode='bilinear', align_corners=False)
+        
+        # 保护性检查 - 如果掩码全0则返回安全值
+        if text_masks.sum() == 0:
+            return torch.tensor(0.1, device=attention_logits.device, requires_grad=True)
+        
+        # 计算基础BCE损失
+        bce_loss = self.bce_loss(attention_logits, text_masks)
+        
+        # 应用reduction
+        if self.reduction == 'mean':
+            bce_loss = bce_loss.mean()
+        elif self.reduction == 'sum':
+            bce_loss = bce_loss.sum()
+        
+        # 计算并应用sigmoid - 使用更大的eps值
+        attn_probs = torch.sigmoid(attention_logits)
         eps = 1e-7
-        attention_prob = attention_prob.clamp(min=eps, max=1.0-eps)
-        entropy = -attention_prob * torch.log(attention_prob) - (1-attention_prob) * torch.log(1-attention_prob)
-        entropy_loss = -entropy.mean()
-        return entropy_loss
-    
-    def update_entropy_weight(self, current_iter, total_iter):
-        """动态更新熵正则化权重"""
-        progress = min(1.0, current_iter / total_iter)
+        attn_probs = torch.clamp(attn_probs, min=eps, max=1.0-eps)
         
-        if progress < 0.25:
-            factor = progress * 4 * 0.2
-        else:
-            factor = 0.2 + 0.8 * ((progress - 0.25) / 0.75) ** 2
+        # 计算熵 - 添加保护措施
+        entropy = -attn_probs * torch.log(attn_probs) - (1-attn_probs) * torch.log(1-attn_probs)
         
-        self.entropy_weight = self.initial_entropy_weight + factor * (self.target_entropy_weight - self.initial_entropy_weight)
-        return self.entropy_weight
-    
-    def forward(self, attention_maps, text_prompts, objects_info, device=None):
-        """
-        计算整合注意力图与整合掩码之间的损失
+        # 1. 强化Focal Loss - 增加gamma值增强对难样本的关注
+        gamma = 3.0  # 从2.0增加到3.0
+        pt = torch.where(text_masks > 0.5, attn_probs, 1-attn_probs)
+        focal_weight = (1 - pt) ** gamma
+        focal_bce_loss = (focal_weight * bce_loss).mean()
         
-        Args:
-            attention_maps (Tensor): 注意力图，shape (B, 1, H, W)
-            text_prompts (list): 文本提示列表，长度为B
-            objects_info (list): 对象信息列表
-            device (torch.device): 设备
-        """
-        batch_size = len(text_prompts)
-        device = attention_maps.device if device is None else device
-        loss = torch.tensor(0.0, device=device)
-        valid_samples = 0
+        # 3. 精确率-召回率平衡损失
+        # 掩码区域的平均注意力 (召回率相关)
+        mask_attn = (attn_probs * text_masks).sum() / (text_masks.sum() + eps)
+        # 非掩码区域的平均注意力 (精确率相关) - 应该尽可能低
+        non_mask_attn = (attn_probs * (1-text_masks)).sum() / ((1-text_masks).sum() + eps)
+        # 对比损失 - 提高掩码区域与非掩码区域的注意力差距
+        contrast_loss = non_mask_attn / (mask_attn + eps)
         
-        # 计算正则化损失
-        entropy_loss = self.entropy_regularization(attention_maps)
+        # 4. 掩码边界关注损失 - 特别关注边界区域
+        # 使用形态学操作找到边界 (简化版本)
+        # 先模拟边界提取
+        kernel_size = 3
+        padding = kernel_size // 2
+        pool_masks = F.max_pool2d(text_masks, kernel_size=kernel_size, 
+                                 stride=1, padding=padding)
+        boundary_masks = pool_masks - text_masks
+        # 边界区域特别关注
+        boundary_loss = F.mse_loss(attn_probs * boundary_masks, boundary_masks)
         
-        for i in range(batch_size):
-            if i >= len(objects_info) or not objects_info[i]:
-                continue
-                
-            objects = objects_info[i]
-            h, w = attention_maps[i].shape[-2:]
-            
-            # 创建整合掩码 - 包含所有对象，不再检查类别与文本的匹配
-            combined_mask = torch.zeros((1, h, w), device=device)
-            has_objects = False
-            
-            # 整合所有对象掩码
-            for obj in objects:
-                if 'mask_encoded' in obj:
-                    try:
-                        # 解码掩码并调整大小
-                        obj_mask = decode_mask(obj['mask_encoded'])
-                        if obj_mask is not None and obj_mask.sum() > 0:
-                            has_objects = True
-                            # 调整掩码大小并转换为张量
-                            obj_mask = self.resize_mask(obj_mask, (h, w)).to(device)
-                            # 合并掩码 - 使用最大值
-                            combined_mask = torch.max(combined_mask, obj_mask[0])
-                    except Exception:
-                        continue
-            
-            # 只有当图像中有有效对象时才计算损失
-            if has_objects:
-                # 获取当前样本的注意力图
-                attention_map = attention_maps[i:i+1]
-                
-                # 计算BCE损失
-                sample_loss = self.bce_loss(attention_map, combined_mask.unsqueeze(0))
-                
-                # 应用reduction
-                if self.reduction == 'mean':
-                    sample_loss = sample_loss.mean()
-                elif self.reduction == 'sum':
-                    sample_loss = sample_loss.sum()
-                
-                loss += sample_loss
-                valid_samples += 1
+        # 5. 组合损失 - 调整权重分配
+        final_loss = focal_bce_loss + 1.0 * contrast_loss + 0.5 * boundary_loss
         
-        # 避免除以零
-        if valid_samples > 0:
-            loss = loss / valid_samples
-        
-        # 添加正则化损失
-        final_loss = loss + self.entropy_weight * entropy_loss
+        # 最后添加损失裁剪（在返回前）
+        final_loss = torch.clamp(final_loss, max=10.0)  # 限制最大损失值为10
         
         return self.loss_weight * final_loss
 

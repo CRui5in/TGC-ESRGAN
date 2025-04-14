@@ -141,10 +141,10 @@ class TGSRModel(SRGANModel):
             self.cri_control = build_loss(cri_control_opt).to(self.device)
             logger.info(f'初始化控制特征损失: {cri_control_opt["type"]}')
         
-        # if 'cri_attention' in train_opt:
-        #     cri_attention_opt = train_opt['cri_attention']
-        #     self.cri_attention = build_loss(cri_attention_opt).to(self.device)
-        #     logger.info(f'初始化文本区域监督注意力损失: {cri_attention_opt["type"]}')
+        if 'cri_attention' in train_opt:
+            cri_attention_opt = train_opt['cri_attention']
+            self.cri_attention = build_loss(cri_attention_opt).to(self.device)
+            logger.info(f'初始化文本区域监督注意力损失: {cri_attention_opt["type"]}')
         
         # 特征投影层，用于投影特征到文本空间维度
         if hasattr(self, 'text_dim'):
@@ -243,6 +243,9 @@ class TGSRModel(SRGANModel):
             # 存储文本提示
             if self.use_text_features:
                 self.queue_text_prompts = [''] * self.queue_size
+            # 存储对象信息
+            if hasattr(self, 'objects_info') and self.objects_info is not None:
+                self.queue_objects_info = [None] * self.queue_size
             self.queue_ptr = 0
         if self.queue_ptr == self.queue_size:  # 队列已满
             # 出队和入队
@@ -250,15 +253,22 @@ class TGSRModel(SRGANModel):
             idx = torch.randperm(self.queue_size)
             self.queue_lr = self.queue_lr[idx]
             self.queue_gt = self.queue_gt[idx]
-            # 打乱文本提示
+            # 打乱文本提示和对象信息
             if self.use_text_features:
                 self.queue_text_prompts = [self.queue_text_prompts[i] for i in idx.tolist()]
+            # 打乱对象信息
+            if hasattr(self, 'objects_info') and self.objects_info is not None and hasattr(self, 'queue_objects_info'):
+                self.queue_objects_info = [self.queue_objects_info[i] for i in idx.tolist()]
             # 获取前b个样本
             lq_dequeue = self.queue_lr[0:b, :, :, :].clone()
             gt_dequeue = self.queue_gt[0:b, :, :, :].clone()
             # 获取文本提示
             if self.use_text_features:
                 text_prompts_dequeue = self.queue_text_prompts[0:b]
+            # 获取对象信息
+            objects_info_dequeue = None
+            if hasattr(self, 'objects_info') and self.objects_info is not None and hasattr(self, 'queue_objects_info'):
+                objects_info_dequeue = self.queue_objects_info[0:b]
             # 更新队列
             self.queue_lr[0:b, :, :, :] = self.lq.clone()
             self.queue_gt[0:b, :, :, :] = self.gt.clone()
@@ -266,6 +276,10 @@ class TGSRModel(SRGANModel):
             if self.use_text_features:
                 self.queue_text_prompts[0:b] = self.text_prompts
                 self.text_prompts = text_prompts_dequeue
+            # 更新对象信息
+            if hasattr(self, 'objects_info') and self.objects_info is not None and hasattr(self, 'queue_objects_info'):
+                self.queue_objects_info[0:b] = self.objects_info
+                self.objects_info = objects_info_dequeue
             
             self.lq = lq_dequeue
             self.gt = gt_dequeue
@@ -276,6 +290,11 @@ class TGSRModel(SRGANModel):
             # 入队文本提示
             if self.use_text_features:
                 self.queue_text_prompts[self.queue_ptr:self.queue_ptr + b] = self.text_prompts
+            # 入队对象信息
+            if hasattr(self, 'objects_info') and self.objects_info is not None:
+                if not hasattr(self, 'queue_objects_info'):
+                    self.queue_objects_info = [None] * self.queue_size
+                self.queue_objects_info[self.queue_ptr:self.queue_ptr + b] = self.objects_info
             self.queue_ptr = self.queue_ptr + b
 
     @torch.no_grad()
@@ -598,8 +617,8 @@ class TGSRModel(SRGANModel):
         save_path_root = self.opt['path']['visualization']
         if save_img and not osp.exists(save_path_root):
             os.makedirs(save_path_root, exist_ok=True)
-            if self.opt.get('val', {}).get('save_attention_maps', False):
-                os.makedirs(osp.join(save_path_root, 'attention'), exist_ok=True)
+        # if self.opt.get('val', {}).get('save_attention_maps', False):
+        #     os.makedirs(osp.join(save_path_root, 'attention'), exist_ok=True)
         
         # 添加计数器，限制只测试前1000张图片
         test_count = 0
@@ -651,7 +670,7 @@ class TGSRModel(SRGANModel):
             
             # 计算指标和保存图像
             visuals = self.get_current_visuals()
-            sr_img = tensor2img([visuals['result']])
+            sr_img_original = tensor2img([visuals['result']])  # 原始超分辨率结果
             
             # 只保存前20张图片的结果
             save_this_img = save_img and idx < 20
@@ -660,9 +679,12 @@ class TGSRModel(SRGANModel):
             if save_this_img and self.attention_maps:
                 attention_maps = self.get_current_attention_maps()
                 if attention_maps:
+                    # 创建sr_img的独立副本用于热力图处理
+                    sr_img_heatmap = sr_img_original.copy()
+                    
                     # 1. 使用GradCAM风格保存合并后的注意力图
                     if self.opt.get('val', {}).get('save_attention_maps', False):
-                        attn_save_path = self.save_gradcam_attention(sr_img, attention_maps, img_name, save_path_root, current_iter)
+                        attn_save_path = self.save_gradcam_attention(sr_img_heatmap, attention_maps, img_name, save_path_root, current_iter)
                     
                     # 2. 新增：直接在输出图像上叠加注意力图
                     # 合并所有注意力图
@@ -670,7 +692,7 @@ class TGSRModel(SRGANModel):
                     combined_map = np.mean(all_maps, axis=0)
                     
                     # 确保尺寸匹配
-                    combined_map = cv2.resize(combined_map, (sr_img.shape[1], sr_img.shape[0]), interpolation=cv2.INTER_LINEAR)
+                    combined_map = cv2.resize(combined_map, (sr_img_heatmap.shape[1], sr_img_heatmap.shape[0]), interpolation=cv2.INTER_LINEAR)
                     
                     # 应用CLAHE自适应直方图均衡化增强对比度
                     combined_map_uint8 = (combined_map * 255).astype(np.uint8)
@@ -680,8 +702,8 @@ class TGSRModel(SRGANModel):
                     # 创建热力图
                     heatmap = cv2.applyColorMap((combined_map_enhanced * 255).astype(np.uint8), cv2.COLORMAP_JET)
                     
-                    # 叠加到原图上
-                    overlay_img = cv2.addWeighted(sr_img, 0.7, heatmap, 0.3, 0)
+                    # 使用另一个副本叠加热力图，避免修改sr_img_heatmap
+                    overlay_img = cv2.addWeighted(sr_img_heatmap.copy(), 0.7, heatmap, 0.3, 0)
                     
                     # 保存叠加图
                     overlay_save_path = osp.join(save_path_root, f'{img_name}_overlay_{current_iter}.png')
@@ -716,30 +738,123 @@ class TGSRModel(SRGANModel):
                     unguided_img = tensor2img([unguided_output.detach().cpu()])
                     # 创建对比图
                     if self.opt.get('val', {}).get('save_comparison', False):
-                        # 创建三列对比图（LQ、无引导、有引导）
-                        guided_img = sr_img
+                        # 创建四列对比图（LQ、无引导、有引导、GT+掩码）
+                        # 使用原始的SR结果，而不是可能被修改的sr_img
+                        guided_img = sr_img_original.copy()  # 确保创建新的副本
                         lq_img = tensor2img([self.lq])
+                        gt_img = tensor2img([visuals['gt']])
+                        
+                        # 准备注意力图和掩码图像
+                        overlay_ratio = 0.0  # 默认重叠率
+                        gt_with_mask = gt_img.copy()  # 初始化为原始GT图像
+                        
+                        # 获取注意力图
+                        attention_map = None
+                        if hasattr(self, 'attention_maps') and self.attention_maps is not None and len(self.attention_maps) > 0:
+                            # 获取最后一个注意力图（通常是最终的高分辨率注意力）
+                            attn_logits = self.attention_maps[-1]
+                            # 取第一个样本的注意力图
+                            attention_map = torch.sigmoid(attn_logits[0, 0]).detach().cpu().numpy()
+                            # 调整大小到GT尺寸
+                            attention_map = cv2.resize(attention_map, (gt_img.shape[1], gt_img.shape[0]), interpolation=cv2.INTER_LINEAR)
+                        
+                        # 处理掩码 - 使用验证数据中的掩码
+                        if 'objects_info_str' in val_data:
+                            try:
+                                import json
+                                objects_info = json.loads(val_data['objects_info_str'][0])
+                                
+                                if objects_info:
+                                    h, w = gt_img.shape[:2]
+                                    mask = np.zeros((h, w), dtype=np.uint8)
+                                    
+                                    # 处理所有对象掩码
+                                    for obj in objects_info:
+                                        if 'mask_encoded' in obj:
+                                            try:
+                                                from tgsr.losses.tgsr_loss import decode_mask
+                                                obj_mask = decode_mask(obj['mask_encoded'])
+                                                if obj_mask is not None and obj_mask.sum() > 0:
+                                                    # 调整掩码大小
+                                                    obj_mask_resized = cv2.resize(obj_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+                                                    # 合并掩码
+                                                    mask = np.maximum(mask, obj_mask_resized)
+                                            except Exception as e:
+                                                print(f"掩码处理错误: {e}")
+                                                continue
+                                    
+                                    # 生成掩码覆盖的GT图像
+                                    if mask.sum() > 0:
+                                        # 创建带边界线的掩码覆盖
+                                        mask_overlay = gt_img.copy()
+                                        
+                                        # 为掩码区域添加半透明覆盖
+                                        mask_colored = np.zeros_like(gt_img)
+                                        mask_colored[mask > 0] = [0, 255, 0]  # 绿色
+                                        gt_with_mask = cv2.addWeighted(gt_img, 0.85, mask_colored, 0.15, 0)
+                                        
+                                        # 添加边界线以增强可见性
+                                        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                        cv2.drawContours(gt_with_mask, contours, -1, (0, 255, 0), 1)  # 绿色边界线
+                                        
+                                        # 计算掩码和注意力图的重叠率
+                                        if attention_map is not None:
+                                            # 正确计算重叠率
+                                            # 1. 注意力图中高于均值的点被认为是"注意"区域
+                                            attention_thresh = np.mean(attention_map) + 0.5 * np.std(attention_map)
+                                            attention_binary = (attention_map > attention_thresh).astype(np.float32)
+                                            
+                                            # 2. 计算交集和并集
+                                            mask_binary = (mask > 0).astype(np.float32)
+                                            intersection = np.sum(attention_binary * mask_binary)
+                                            mask_area = np.sum(mask_binary)
+                                            
+                                            # 3. 计算重叠率（交集除以掩码面积）
+                                            if mask_area > 0:
+                                                overlay_ratio = intersection / mask_area
+                                                
+                                                # 可视化注意力图和掩码重叠区域（仅调试使用）
+                                                if self.opt.get('val', {}).get('save_debug_overlap', False):
+                                                    overlap_debug = np.zeros((h, w, 3), dtype=np.uint8)
+                                                    # 蓝色表示掩码
+                                                    overlap_debug[mask_binary > 0] = [255, 0, 0]
+                                                    # 绿色表示注意力高区域
+                                                    overlap_debug[attention_binary > 0] = [0, 255, 0]
+                                                    # 红色表示重叠区域
+                                                    overlap_debug[(mask_binary > 0) & (attention_binary > 0)] = [0, 0, 255]
+                                                    
+                                                    # 保存可视化图像
+                                                    debug_path = osp.join(save_path_root, f'{img_name}_overlap_debug_{current_iter}.png')
+                                                    imwrite(overlap_debug, debug_path)
+                            except Exception as e:
+                                print(f"对象信息处理错误: {e}")
                         
                         h, w = guided_img.shape[:2]
-                        # 将lq调整到相同大小以便对比显示
+                        # 将所有图像调整到相同大小以便对比显示
                         lq_img = cv2.resize(lq_img, (w, h), interpolation=cv2.INTER_NEAREST)
+                        gt_with_mask = cv2.resize(gt_with_mask, (w, h), interpolation=cv2.INTER_NEAREST)
                         
-                        comparison = np.zeros((h, w*3, 3), dtype=np.uint8)
+                        # 创建四列对比图（LQ、无引导、有引导、GT+掩码）
+                        comparison = np.zeros((h, w*4, 3), dtype=np.uint8)
                         comparison[:, :w] = lq_img        # 第一列显示LQ
                         comparison[:, w:2*w] = unguided_img  # 第二列显示无引导结果
-                        comparison[:, 2*w:] = guided_img    # 第三列显示引导结果
+                        comparison[:, 2*w:3*w] = guided_img    # 第三列显示引导结果
+                        comparison[:, 3*w:] = gt_with_mask      # 第四列显示GT+掩码
                         
                         # 添加分割线
                         comparison[:, w-1:w+1] = [0, 0, 255]  # 红色分割线
                         comparison[:, 2*w-1:2*w+1] = [0, 0, 255]  # 红色分割线
+                        comparison[:, 3*w-1:3*w+1] = [0, 0, 255]  # 红色分割线
                         
-                        save_comp_path = osp.join(save_path_root, f'{img_name}_comparison_{current_iter}.png')
+                        # 将重叠率添加到文件名中
+                        overlap_text = f"_overlap{overlay_ratio:.2f}"
+                        save_comp_path = osp.join(save_path_root, f'{img_name}_comparison{overlap_text}_{current_iter}.png')
                         imwrite(comparison, save_comp_path)
             
             # 计算指标
             if with_metrics and 'gt' in val_data:
                 gt_img = tensor2img([visuals['gt']])
-                metric_data = {'img': sr_img, 'img2': gt_img}
+                metric_data = {'img': sr_img_original, 'img2': gt_img}
                 for name, opt_ in self.opt['val']['metrics'].items():
                     self.metric_results[name] += calculate_metric(metric_data, opt_)
                 
@@ -909,20 +1024,44 @@ class TGSRModel(SRGANModel):
             # ControlNet架构不再使用以下缓存
             # 1. 注意力损失
             if hasattr(self, 'cri_attention') and hasattr(self, 'attention_maps') and objects_info is not None:
-                # 使用注意力图直接计算损失，而不是缓存的attention_maps
-                if len(self.attention_maps) > 0:
-                    # 使用最后一个注意力图
-                    attn_logits = self.attention_maps[-1]
-                    
-                    # 动态更新熵正则化权重
-                    if hasattr(self.cri_attention, 'update_entropy_weight'):
-                        total_iters = self.opt.get('train', {}).get('total_iter', 400000)
-                        entropy_weight = self.cri_attention.update_entropy_weight(current_iter, total_iters)
-                    
-                    # 计算注意力损失
-                    l_t_attn = self.cri_attention(attn_logits, self.text_prompts, objects_info, self.device)
-                    l_t_total += l_t_attn
-                    loss_dict['l_t_attn'] = l_t_attn
+                # 计算注意力损失
+                attn_logits = self.attention_maps[-1]
+                
+                # 从对象信息中创建掩码
+                batch_size = attn_logits.shape[0]
+                h, w = attn_logits.shape[-2:]
+                text_masks = torch.zeros((batch_size, 1, h, w), device=self.device)
+                
+                # 为每个样本创建掩码
+                for i in range(batch_size):
+                    if i >= len(objects_info) or not objects_info[i]:
+                        continue
+                        
+                    objects = objects_info[i]
+                    # 合并对象掩码为单个文本掩码
+                    for obj in objects:
+                        if 'mask_encoded' in obj:
+                            try:
+                                # 解码掩码并调整大小
+                                from tgsr.losses.tgsr_loss import decode_mask
+                                obj_mask = decode_mask(obj['mask_encoded'])
+                                if obj_mask is not None and obj_mask.sum() > 0:
+                                    # 调整掩码大小并合并
+                                    obj_mask_tensor = torch.from_numpy(obj_mask).float().to(self.device)
+                                    obj_mask_tensor = F.interpolate(
+                                        obj_mask_tensor.unsqueeze(0).unsqueeze(0), 
+                                        size=(h, w), 
+                                        mode='bilinear', 
+                                        align_corners=False
+                                    )
+                                    text_masks[i] = torch.max(text_masks[i], obj_mask_tensor[0])
+                            except Exception:
+                                continue
+                
+                # 使用正确的参数调用attention损失函数
+                l_t_attn = self.cri_attention(attn_logits, text_masks)
+                l_t_total += l_t_attn
+                loss_dict['l_t_attn'] = l_t_attn
             
             # 特征平滑性损失 - 防止特征过于剧烈变化
             if hasattr(self, 'attention_maps') and len(self.attention_maps) > 0:
@@ -946,9 +1085,8 @@ class TGSRModel(SRGANModel):
                 loss_dict['l_t_total'] = l_t_total
                 l_t_total.backward()
                 
-                # 梯度裁剪，防止梯度爆炸
-                if self.is_train:
-                    torch.nn.utils.clip_grad_norm_(self.net_t.parameters(), max_norm=1.0)
+                # 添加梯度裁剪，放在optimizer_t.step()前
+                torch.nn.utils.clip_grad_norm_(self.net_t.parameters(), max_norm=1.0)
         
         # 执行优化器步骤
         self.optimizer_g.step()
@@ -1035,8 +1173,6 @@ class TGSRModel(SRGANModel):
             self.save_network(self.net_g, 'net_g', current_iter)
         self.save_network(self.net_d, 'net_d', current_iter)
         self.save_network(self.net_t, 'net_t', current_iter)
-        # 保存判别器
-        self.save_network(self.net_d, 'net_d', current_iter)
         # 保存训练状态
         self.save_training_state(epoch, current_iter) 
     
@@ -1053,12 +1189,15 @@ class TGSRModel(SRGANModel):
         if len(attention_maps) == 0:
             return
         
+        # 创建输入图像的副本，避免修改原始图像
+        img_copy = img.copy()
+        
         # 1. 合并所有注意力图（使用平均值）
         all_maps = np.stack([attn for attn in attention_maps.values()])
         combined_map = np.mean(all_maps, axis=0)
         
         # 确保尺寸匹配
-        combined_map = cv2.resize(combined_map, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
+        combined_map = cv2.resize(combined_map, (img_copy.shape[1], img_copy.shape[0]), interpolation=cv2.INTER_LINEAR)
         
         # 应用非线性变换增强对比度 - 使用自适应阈值化
         # 1. 计算均值和标准差
@@ -1091,11 +1230,11 @@ class TGSRModel(SRGANModel):
         # 2. 转换为热力图
         heatmap = cv2.applyColorMap((enhanced_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
         
-        # 3. 叠加到原图（透明度0.4）
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img.shape[2] == 3 else img.copy()
+        # 3. 叠加到原图（透明度0.4）- 使用副本避免修改原始图像
+        img_rgb = cv2.cvtColor(img_copy, cv2.COLOR_BGR2RGB) if img_copy.shape[2] == 3 else img_copy.copy()
         overlay = cv2.addWeighted(img_rgb, 0.6, heatmap, 0.4, 0)
         
-        # 4. 添加颜色图例
+        # 4. 添加颜色图例 - 创建新的图例图像，不修改原始输入
         h, w = overlay.shape[:2]
         # 图例高度和宽度
         legend_h, legend_w = 30, w

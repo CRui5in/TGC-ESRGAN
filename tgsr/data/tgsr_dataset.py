@@ -56,6 +56,36 @@ def encode_mask(mask):
     return rle
 
 
+# 增强掩码与图像同步
+def augment_mask(mask, flip_h=False, rot=False):
+    """对掩码应用与图像相同的增强变换，确保与BasicSR中的augment函数完全一致
+    
+    Args:
+        mask (np.ndarray): 二维掩码数组
+        flip_h (bool): 是否水平翻转
+        rot (bool): 是否旋转90度
+        
+    Returns:
+        np.ndarray: 增强后的掩码
+    """
+    # 确保掩码是二维数组
+    assert len(mask.shape) == 2, f"掩码应该是二维数组, 但是形状是 {mask.shape}"
+    
+    # 创建副本以避免修改原始数据
+    mask = mask.copy()
+    
+    # 1. 水平翻转 (如需要) - 与basicsr完全一致
+    if flip_h:
+        mask = mask[:, ::-1]
+    
+    # 2. 旋转 (如需要) - 与basicsr完全一致：先转置后水平翻转
+    if rot:
+        mask = mask.transpose(1, 0)  # HW -> WH
+        mask = mask[:, ::-1]  # 水平翻转
+    
+    return mask
+
+
 @DATASET_REGISTRY.register()
 class TGSRDataset(data.Dataset):
     """Dataset用于文本引导的超分辨率模型。
@@ -123,7 +153,7 @@ class TGSRDataset(data.Dataset):
             self.get_objects = lambda idx: self.captions[idx].get('objects', [])
         
         # 初始化数据增强选项
-        self.use_hflip = opt.get('use_hflip', True)
+        self.use_hflip = opt.get('use_hflip', False)
         self.use_rot = opt.get('use_rot', False)  # 不推荐使用旋转，会影响文本与图像的一致性
         self.gt_size = opt.get('gt_size', 256)
         
@@ -250,8 +280,31 @@ class TGSRDataset(data.Dataset):
         if retry == 0:
             raise Exception(f"加载图像失败，已重试3次: {img_gt_path}")
             
+        # 记录是否使用翻转和旋转
+        use_hflip = self.use_hflip and random.random() < 0.5
+        use_rot = self.use_rot and random.random() < 0.5
+            
         # 图像增强处理 - 使用与RealESRGAN相同的方法
-        img_gt = augment(img_gt, self.use_hflip, self.use_rot)
+        img_gt = augment(img_gt, use_hflip, use_rot)
+
+        # 同步对对象的掩码进行增强
+        if objects_info:
+            for obj in objects_info:
+                if 'mask_encoded' in obj:
+                    try:
+                        # 解码掩码
+                        mask = decode_mask(obj['mask_encoded'])
+                        
+                        # 对掩码应用相同的增强
+                        mask = augment_mask(mask, use_hflip, use_rot)
+                        
+                        # 重新编码掩码
+                        obj['mask_encoded'] = encode_mask(mask)
+                    except Exception as e:
+                        logger = get_root_logger() if hasattr(self, 'logger') else None
+                        if logger:
+                            logger.warning(f"处理掩码时出错: {e}")
+                        # 如果处理失败，保留原始掩码
 
         # 调整到固定尺寸 - 确保输出始终是crop_pad_size x crop_pad_size
         h, w = img_gt.shape[0:2]
@@ -262,6 +315,25 @@ class TGSRDataset(data.Dataset):
             # 使用INTER_AREA进行下采样（缩小），使用INTER_LINEAR进行上采样（放大）
             interpolation = cv2.INTER_AREA if h > crop_pad_size or w > crop_pad_size else cv2.INTER_LINEAR
             img_gt = cv2.resize(img_gt, (crop_pad_size, crop_pad_size), interpolation=interpolation)
+            
+            # 同样调整所有对象的掩码大小
+            if objects_info:
+                for obj in objects_info:
+                    if 'mask_encoded' in obj:
+                        try:
+                            # 解码掩码
+                            mask = decode_mask(obj['mask_encoded'])
+                            
+                            # 调整掩码大小 - 使用INTER_NEAREST保留二值性质
+                            mask_resized = cv2.resize(mask, (crop_pad_size, crop_pad_size), 
+                                                     interpolation=cv2.INTER_NEAREST)
+                            
+                            # 重新编码掩码
+                            obj['mask_encoded'] = encode_mask(mask_resized)
+                        except Exception as e:
+                            logger = get_root_logger() if hasattr(self, 'logger') else None
+                            if logger:
+                                logger.warning(f"调整掩码大小时出错: {e}")
         
         # 确保大小正确
         assert img_gt.shape[0] == crop_pad_size and img_gt.shape[1] == crop_pad_size, \
