@@ -945,6 +945,47 @@ class TGSRModel(SRGANModel):
         # 保存当前迭代次数
         self.iter = current_iter
         
+        # 检查是否处于阶段转换点，如果是，重置判别器
+        if self.opt['train'].get('stage_train', False) and hasattr(self.opt['train'], 'stages') and len(self.opt['train']['stages']) > 1:
+            stage_iters = [0]
+            for i, stage in enumerate(self.opt['train']['stages']):
+                if i > 0:
+                    stage_iters.append(stage_iters[i-1] + stage['iters'])
+            
+            # 如果当前迭代次数是某个阶段的开始(允许有1次误差)
+            if current_iter in stage_iters or current_iter - 1 in stage_iters:
+                # 获取当前所处阶段
+                current_stage_idx = 0
+                for i, iter_point in enumerate(stage_iters[1:], 1):
+                    if current_iter >= iter_point - 1:
+                        current_stage_idx = i
+                
+                # 只在进入联合训练阶段时重置判别器
+                if current_stage_idx > 0 and "warmup" in self.opt['train']['stages'][current_stage_idx-1]['name']:
+                    self.logger.info(f'在阶段 {current_stage_idx} 开始时重置判别器参数')
+                    # 使用Kaiming初始化重置判别器
+                    for m in self.net_d.modules():
+                        if isinstance(m, nn.Conv2d):
+                            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu', a=0.2)
+                            if m.bias is not None:
+                                nn.init.constant_(m.bias, 0)
+                        elif isinstance(m, nn.BatchNorm2d):
+                            nn.init.constant_(m.weight, 1)
+                            nn.init.constant_(m.bias, 0)
+                        elif isinstance(m, nn.Linear):
+                            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu', a=0.2)
+                            if m.bias is not None:
+                                nn.init.constant_(m.bias, 0)
+                    
+                    # 重新创建判别器优化器
+                    if hasattr(self, 'optimizer_d'):
+                        optim_d_config = self.opt['train']['optim_d'].copy()
+                        optim_type = optim_d_config.pop('type')
+                        self.optimizer_d = self.get_optimizer(optim_type, self.net_d.parameters(), **optim_d_config)
+                        # 更新优化器列表
+                        if len(self.optimizers) > 1:
+                            self.optimizers[1] = self.optimizer_d
+        
         # 定期清理CUDA缓存以减少内存碎片
         if current_iter % 50 == 0:
             torch.cuda.empty_cache()
