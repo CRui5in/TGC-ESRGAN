@@ -94,8 +94,10 @@ class TextRegionAttentionLoss(nn.Module):
         mask_attn = (attn_probs * text_masks).sum() / (text_masks.sum() + eps)
         # 非掩码区域的平均注意力 (精确率相关) - 应该尽可能低
         non_mask_attn = (attn_probs * (1-text_masks)).sum() / ((1-text_masks).sum() + eps)
-        # 对比损失 - 提高掩码区域与非掩码区域的注意力差距
-        contrast_loss = non_mask_attn / (mask_attn + eps)
+        
+        # 修改对比损失计算方式 - 使用直接的差值而不是比率
+        # 希望掩码区域注意力比非掩码区域至少高0.5
+        contrast_loss = torch.clamp(non_mask_attn - mask_attn + 0.5, min=0.0)
         
         # 4. 掩码边界关注损失 - 特别关注边界区域
         # 使用形态学操作找到边界 (简化版本)
@@ -105,11 +107,13 @@ class TextRegionAttentionLoss(nn.Module):
         pool_masks = F.max_pool2d(text_masks, kernel_size=kernel_size, 
                                  stride=1, padding=padding)
         boundary_masks = pool_masks - text_masks
-        # 边界区域特别关注
-        boundary_loss = F.mse_loss(attn_probs * boundary_masks, boundary_masks)
+        
+        # 增强边界损失 - 增加权重
+        boundary_weight = 1.5  # 从0.5增至1.5
+        boundary_loss = F.mse_loss(attn_probs * boundary_masks, boundary_masks) * boundary_weight
         
         # 5. 组合损失 - 调整权重分配
-        final_loss = focal_bce_loss + 1.0 * contrast_loss + 0.5 * boundary_loss
+        final_loss = focal_bce_loss + 1.5 * contrast_loss + boundary_loss
         
         # 最后添加损失裁剪（在返回前）
         final_loss = torch.clamp(final_loss, max=10.0)  # 限制最大损失值为10

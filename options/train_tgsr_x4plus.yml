@@ -12,35 +12,33 @@ percep_gt_usm: True
 gan_gt_usm: False
 
 # the first degradation process
-resize_prob: [0.3, 0.4, 0.3]  # up, down, keep - 增加保持原尺寸的概率
-resize_range: [0.3, 1.3]  # 缩小尺度范围，减少极端情况
-gaussian_noise_prob: 0.4  # 降低高斯噪声概率
-noise_range: [1, 20]  # 降低噪声上限
-poisson_scale_range: [0.05, 2.0]  # 降低泊松噪声尺度
-gray_noise_prob: 0.3  # 降低灰度噪声概率
-jpeg_range: [40, 95]  # 提高JPEG压缩下限，减少过度压缩
+resize_prob: [0.2, 0.7, 0.1]  # up, down, keep
+resize_range: [0.4, 1.1]
+gaussian_noise_prob: 0.5
+noise_range: [1, 15]
+poisson_scale_range: [0.05, 1.5]
+gray_noise_prob: 0.4
+jpeg_range: [40, 95]
 
 # the second degradation process
-second_blur_prob: 0.6  # 降低二次模糊概率
-resize_prob2: [0.3, 0.4, 0.3]  # up, down, keep - 增加保持原尺寸的概率
-resize_range2: [0.4, 1.0]  # 缩小尺度范围
-gaussian_noise_prob2: 0.4  # 降低高斯噪声概率
-noise_range2: [1, 15]  # 大幅降低噪声上限
-poisson_scale_range2: [0.05, 1.8]  # 降低泊松噪声尺度
-gray_noise_prob2: 0.3  # 降低灰度噪声概率
-jpeg_range2: [45, 95]  # 提高JPEG压缩下限
+second_blur_prob: 0.8
+resize_prob2: [0.3, 0.4, 0.3]  # up, down, keep
+resize_range2: [0.5, 1.0]
+gaussian_noise_prob2: 0.5
+noise_range2: [1, 10]
+poisson_scale_range2: [0.05, 1.2]
+gray_noise_prob2: 0.4
+jpeg_range2: [45, 95]
 
 
-gt_size: 256
+gt_size: 512
 queue_size: 144  # 减小队列大小以减少内存使用
-
-accumulate_grad_batches: 4
 
 # -------------- CLIP text encoder settings -------------- #
 text_encoder:
   name: /root/autodl-tmp/clip-vit-base-patch32
   text_dim: 512
-  freeze: true
+  freeze: false  # 解冻CLIP编码器让它适应SR任务
 
 # dataset and data loader settings
 datasets:
@@ -52,31 +50,31 @@ datasets:
     io_backend:
       type: disk
 
-    blur_kernel_size: 17  # 减小模糊核大小
+    blur_kernel_size: 7
     kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
     kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
     sinc_prob: 0.1
-    blur_sigma: [0.2, 2.0]  # 降低模糊上限
-    betag_range: [0.5, 3.5]  # 降低广义高斯beta参数
-    betap_range: [1, 1.8]  # 降低高原beta参数
+    blur_sigma: [0.1, 1.5]
+    betag_range: [0.5, 2.5]
+    betap_range: [1, 1.5]
 
-    blur_kernel_size2: 17  # 减小第二次模糊核大小
+    blur_kernel_size2: 7
     kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
     kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
     sinc_prob2: 0.1
-    blur_sigma2: [0.2, 1.0]  # 降低第二次模糊上限
-    betag_range2: [0.5, 3.5]  # 降低广义高斯beta参数
-    betap_range2: [1, 1.8]  # 降低高原beta参数
+    blur_sigma2: [0.1, 1.0]
+    betag_range2: [0.5, 2.0]
+    betap_range2: [1, 1.3]
 
-    final_sinc_prob: 0.6  # 降低最终sinc滤波概率
+    final_sinc_prob: 0.4
 
-    gt_size: 256
+    gt_size: 512
     use_hflip: False
     use_rot: False
 
     # data loader
     use_shuffle: true
-    num_worker_per_gpu: 4  
+    num_worker_per_gpu: 3  
     batch_size_per_gpu: 1  
     dataset_enlarge_ratio: 1
     prefetch_mode: cuda  # 使用CUDA进行预取
@@ -89,7 +87,7 @@ datasets:
     text_file: /root/autodl-tmp/tgsr_dataset_hr_only/val_captions.json
     io_backend:
       type: disk
-    gt_size: 256
+    gt_size: 512
     use_hflip: False
     use_rot: False
     num_worker_per_gpu: 2
@@ -138,14 +136,20 @@ train:
   # 分阶段训练
   stage_train: true
   stages:
-    - name: "warmup"  # 第一阶段：先训练文本引导网络
-      iters: 80000
-      freeze_modules: ["net_g"]
-      lr_g: !!float 1e-5
-      lr_d: !!float 5e-5
+    - name: "pretrain_t"  # 第一阶段：预训练文本引导网络
+      iters: 20000  # 缩短预训练阶段
+      freeze_modules: ["net_d"]  # 只冻结判别器，让生成器可以适应文本引导
+      lr_g: !!float 5e-5
+      lr_d: !!float 0
       lr_t: !!float 1e-4
-    - name: "joint"   # 第二阶段：联合训练
-      iters: 320000
+    - name: "joint_light"  # 第二阶段：轻度联合训练
+      iters: 50000
+      freeze_modules: []
+      lr_g: !!float 1e-5  # 生成器使用较小学习率
+      lr_d: !!float 5e-5
+      lr_t: !!float 5e-5
+    - name: "joint_full"   # 第三阶段：完全联合训练
+      iters: 400000
       freeze_modules: []
       lr_g: !!float 1e-4
       lr_d: !!float 1e-4
@@ -172,7 +176,7 @@ train:
     milestones: [400000]
     gamma: 0.5
 
-  total_iter: 400000
+  total_iter: 470000
   warmup_iter: 1000  # 使用warmup
 
   # losses

@@ -174,7 +174,14 @@ class TGSRModel(SRGANModel):
         optim_d_config = train_opt['optim_d'].copy()
         optim_type = optim_d_config.pop('type')
         self.optimizer_d = self.get_optimizer(optim_type, self.net_d.parameters(), **optim_d_config)
-        self.optimizers.append(self.optimizer_d)
+        
+        # 添加这一行，确保每个参数组都有initial_lr参数
+        for param_group in self.optimizer_d.param_groups:
+            param_group['initial_lr'] = param_group['lr']
+        
+        # 更新优化器列表
+        if len(self.optimizers) > 1:
+            self.optimizers[1] = self.optimizer_d
         
         # 优化器T - 文本引导网络（如果使用）
         if self.use_text_features and hasattr(self, 'net_t'):
@@ -227,6 +234,12 @@ class TGSRModel(SRGANModel):
             text_outputs = self.clip_text_encoder(**text_inputs)
             text_hidden = text_outputs.last_hidden_state
             text_pooled = text_outputs.pooler_output
+            
+            # 添加梯度缩放，防止CLIP编码器梯度过大
+            if self.is_train and not self.freeze_text_encoder:
+                # STE (Straight-Through Estimator) 风格的梯度缩放
+                text_hidden = text_hidden.detach() * 0.9 + text_hidden * 0.1
+                text_pooled = text_pooled.detach() * 0.9 + text_pooled * 0.1
         
         return text_hidden, text_pooled
 
@@ -565,21 +578,26 @@ class TGSRModel(SRGANModel):
                 attn = torch.sigmoid(attention_maps[i])
                 # 自适应强度控制 - 训练开始时较低，随着训练进行逐渐增强
                 if self.is_train:
-                    # 计算训练进度调整强度
-                    if hasattr(self, 'opt') and 'train' in self.opt:
-                        total_iter = self.opt['train'].get('total_iter', 400000)
-                        if hasattr(self, 'total_iter'):
-                            total_iter = self.total_iter
-                        progress = min(1.0, self.iter / total_iter) if hasattr(self, 'iter') else 0.5
-                        control_strength = 0.1 + 0.9 * progress  # 从0.1逐渐增加到1.0
-                    else:
-                        control_strength = 0.5
+                    # 使用更保守的控制强度
+                    control_strength = 0.5  # 降低固定强度值
                 else:
-                    control_strength = 1.0  # 测试时使用全强度
+                    control_strength = 0.5  # 测试时使用中等强度
                 
                 # 应用控制 - trunk是变化的特征，locked_features[i]是锁定的参考特征
                 # guided_features提供从锁定特征到修改后特征的映射
                 control_signal = guided_features - locked_features[i]
+                
+                # 简单的幅值限制，防止控制信号过大导致不稳定
+                with torch.no_grad():
+                    max_val = torch.max(torch.abs(control_signal))
+                    if max_val > 5.0:
+                        scale_factor = 5.0 / max_val
+                    else:
+                        scale_factor = 1.0
+                
+                control_signal = control_signal * scale_factor
+                
+                # 应用控制信号 - 使用原始注意力值
                 trunk = trunk + control_strength * control_signal * attn
         
         # 处理主干结束
@@ -945,46 +963,54 @@ class TGSRModel(SRGANModel):
         # 保存当前迭代次数
         self.iter = current_iter
         
-        # 检查是否处于阶段转换点，如果是，重置判别器
-        if self.opt['train'].get('stage_train', False) and hasattr(self.opt['train'], 'stages') and len(self.opt['train']['stages']) > 1:
-            stage_iters = [0]
-            for i, stage in enumerate(self.opt['train']['stages']):
-                if i > 0:
-                    stage_iters.append(stage_iters[i-1] + stage['iters'])
-            
-            # 如果当前迭代次数是某个阶段的开始(允许有1次误差)
-            if current_iter in stage_iters or current_iter - 1 in stage_iters:
-                # 获取当前所处阶段
-                current_stage_idx = 0
-                for i, iter_point in enumerate(stage_iters[1:], 1):
-                    if current_iter >= iter_point - 1:
-                        current_stage_idx = i
-                
-                # 只在进入联合训练阶段时重置判别器
-                if current_stage_idx > 0 and "warmup" in self.opt['train']['stages'][current_stage_idx-1]['name']:
-                    self.logger.info(f'在阶段 {current_stage_idx} 开始时重置判别器参数')
-                    # 使用Kaiming初始化重置判别器
-                    for m in self.net_d.modules():
-                        if isinstance(m, nn.Conv2d):
-                            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu', a=0.2)
-                            if m.bias is not None:
-                                nn.init.constant_(m.bias, 0)
-                        elif isinstance(m, nn.BatchNorm2d):
-                            nn.init.constant_(m.weight, 1)
-                            nn.init.constant_(m.bias, 0)
-                        elif isinstance(m, nn.Linear):
-                            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu', a=0.2)
-                            if m.bias is not None:
-                                nn.init.constant_(m.bias, 0)
+        # 检查是否处于阶段转换点
+        if self.opt['train'].get('stage_train', False):
+            for stage_idx, stage in enumerate(self.opt['train']['stages']):
+                if current_iter == stage['iters'] and stage_idx > 0:  # 确保不是第一个阶段
+                    self.logger.info(f'进入阶段 {stage["name"]} 在迭代 {current_iter}')
                     
-                    # 重新创建判别器优化器
-                    if hasattr(self, 'optimizer_d'):
-                        optim_d_config = self.opt['train']['optim_d'].copy()
-                        optim_type = optim_d_config.pop('type')
-                        self.optimizer_d = self.get_optimizer(optim_type, self.net_d.parameters(), **optim_d_config)
-                        # 更新优化器列表
-                        if len(self.optimizers) > 1:
-                            self.optimizers[1] = self.optimizer_d
+                    # 根据不同阶段使用不同的转换策略
+                    if stage_idx == 1:  # 从预训练到联合轻度训练
+                        # 1. 调整判别器参数，但保持某些层不变
+                        for name, m in self.net_d.named_modules():
+                            if isinstance(m, nn.Conv2d) and 'final' not in name:
+                                # 使用较小初始化权重，避免梯度爆炸
+                                nn.init.normal_(m.weight, 0, 0.02)
+                        
+                        # 2. 调整生成器学习率
+                        for param_group in self.optimizer_g.param_groups:
+                            param_group['lr'] = stage['lr_g']
+                            param_group['initial_lr'] = stage['lr_g']
+                        
+                        # 3. 重建判别器优化器，但权重缩小
+                        if hasattr(self, 'optimizer_d'):
+                            optim_d_config = self.opt['train']['optim_d'].copy()
+                            optim_type = optim_d_config.pop('type')
+                            optim_d_config['lr'] = stage['lr_d']
+                            self.optimizer_d = self.get_optimizer(optim_type, self.net_d.parameters(), **optim_d_config)
+                            
+                            # 确保每个参数组都有initial_lr参数
+                            for param_group in self.optimizer_d.param_groups:
+                                param_group['initial_lr'] = param_group['lr']
+                            
+                            # 更新优化器列表
+                            if len(self.optimizers) > 1:
+                                self.optimizers[1] = self.optimizer_d
+                    
+                    elif stage_idx == 2:  # 从轻度联合到完全联合
+                        # 更新所有优化器的学习率
+                        for param_group in self.optimizer_g.param_groups:
+                            param_group['lr'] = stage['lr_g']
+                            param_group['initial_lr'] = stage['lr_g']
+                            
+                        for param_group in self.optimizer_d.param_groups:
+                            param_group['lr'] = stage['lr_d']
+                            param_group['initial_lr'] = stage['lr_d']
+                            
+                        if hasattr(self, 'optimizer_t'):
+                            for param_group in self.optimizer_t.param_groups:
+                                param_group['lr'] = stage['lr_t']
+                                param_group['initial_lr'] = stage['lr_t']
         
         # 定期清理CUDA缓存以减少内存碎片
         if current_iter % 50 == 0:
@@ -1214,8 +1240,13 @@ class TGSRModel(SRGANModel):
             self.save_network(self.net_g, 'net_g', current_iter)
         self.save_network(self.net_d, 'net_d', current_iter)
         self.save_network(self.net_t, 'net_t', current_iter)
+        
+        # 保存微调后的CLIP文本编码器(如果已解冻)
+        if hasattr(self, 'clip_text_encoder') and not self.freeze_text_encoder:
+            self.save_network(self.clip_text_encoder, 'clip_text_encoder', current_iter)
+        
         # 保存训练状态
-        self.save_training_state(epoch, current_iter) 
+        self.save_training_state(epoch, current_iter)
     
     def save_gradcam_attention(self, img, attention_maps, img_name, save_path, iter_num):
         """将所有注意力图以GradCAM风格叠加在原图上，并添加颜色图例

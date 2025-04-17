@@ -114,6 +114,11 @@ class TextGuidanceNet(nn.Module):
         # 投影文本特征到特征空间
         text_feat = self.text_projector(text_pooled)
         
+        # 增加文本特征与图像特征的交互 - 计算文本特征的通道注意力
+        b, c = text_feat.size()
+        # 生成通道注意力
+        text_channel_attn = torch.sigmoid(text_feat).view(b, c, 1, 1)
+        
         # 准备位置编码（如果启用）
         position_embedding = None
         if self.with_position and position_info is not None:
@@ -122,7 +127,11 @@ class TextGuidanceNet(nn.Module):
         
         # 应用控制块
         attention_maps = []
-        enhanced = features.clone()
+        # 使用通道注意力增强初始特征
+        enhanced = features.clone() * (1.0 + text_channel_attn * 0.2)
+        
+        # 在不同层级应用不同程度的文本引导
+        attention_weights = [1.0, 0.8, 0.6, 0.4, 0.2, 0.1]  # 从早期层到后期层逐渐减弱
         
         for i, zero_block in enumerate(self.zero_blocks):
             # 处理当前块
@@ -134,13 +143,31 @@ class TextGuidanceNet(nn.Module):
             # 应用零初始化控制块 - ControlNet方式
             control_signal = zero_block(block_input, text_feat)
             
+            # 通道平衡处理 - 在生成注意力图之前确保控制信号的通道平衡
+            b, c, h, w = control_signal.shape
+            if c % 3 == 0:
+                # 分组处理RGB通道组
+                channel_groups = c // 3
+                control_rgb = control_signal.view(b, 3, channel_groups, h, w)
+                
+                # 计算每个RGB通道的均值
+                rgb_means = control_rgb.mean(dim=[2, 3, 4], keepdim=True)  # [b, 3, 1, 1, 1]
+                global_mean = rgb_means.mean(dim=1, keepdim=True)  # [b, 1, 1, 1, 1]
+                
+                # 对不平衡的通道进行归一化
+                normalized_rgb = control_rgb * (global_mean / (rgb_means + 1e-8))
+                
+                # 重塑回原始尺寸
+                control_signal = normalized_rgb.view(b, c, h, w)
+            
             # 生成注意力图
             attention_logits = self.attention_generators[i](control_signal)
             attention_maps.append(attention_logits)
             
-            # 应用控制信号
+            # 应用控制信号 - 使用层级权重
+            layer_weight = attention_weights[i] if i < len(attention_weights) else 0.1
             attention = torch.sigmoid(attention_logits)
-            enhanced = enhanced + control_signal * attention
+            enhanced = enhanced + control_signal * attention * layer_weight
             
         return enhanced, attention_maps
 
@@ -154,9 +181,9 @@ class ZeroConvBlock(nn.Module):
         self.act1 = nn.SiLU()
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         
-        # 零初始化最后一层
-        nn.init.zeros_(self.conv2.weight)
-        nn.init.zeros_(self.conv2.bias)
+        # 使用非零但很小的初始化，而不是完全的零初始化
+        nn.init.normal_(self.conv2.weight, 0, 0.01)
+        nn.init.constant_(self.conv2.bias, 0)
         
         # 文本调制
         self.text_modulation = nn.Sequential(
@@ -167,9 +194,9 @@ class ZeroConvBlock(nn.Module):
         )
     
     def ensure_zero_init(self):
-        """确保最后一层确实是零初始化的"""
-        nn.init.zeros_(self.conv2.weight)
-        nn.init.zeros_(self.conv2.bias)
+        """使用小值初始化而非纯零值"""
+        nn.init.normal_(self.conv2.weight, 0, 0.01)
+        nn.init.constant_(self.conv2.bias, 0)
     
     def forward(self, x, text_embedding):
         """
@@ -185,6 +212,43 @@ class ZeroConvBlock(nn.Module):
         # 文本调制 - 计算缩放和偏移
         text_params = self.text_modulation(text_embedding) # [B, C*2]
         scale, shift = torch.chunk(text_params, 2, dim=1)  # 各 [B, C]
+        
+        # 改进通道均衡 - 使用通道归一化而非硬编码权重
+        c = scale.size(1)
+        if c % 3 == 0:  # 确保通道数是3的倍数，对应RGB通道
+            channel_groups = c // 3
+            
+            # 将scale重塑为RGB通道组
+            scale_view = scale.view(scale.size(0), 3, channel_groups)
+            
+            # 计算每个样本中RGB通道的均值
+            scale_mean = scale_view.mean(dim=2, keepdim=True)  # [B, 3, 1]
+            
+            # 计算RGB通道均值间的统计
+            rgb_mean = scale_mean.mean(dim=1, keepdim=True)  # [B, 1, 1]
+            
+            # 归一化RGB通道组间的缩放，使它们均值一致
+            # 这确保红色通道不会获得过高增益
+            scale_norm = scale_view * (rgb_mean / (scale_mean + 1e-8))
+            
+            # 重塑回原始维度
+            scale = scale_norm.view(scale.size(0), -1)
+            
+            # 同样处理shift - 防止颜色通道偏移
+            shift_view = shift.view(shift.size(0), 3, channel_groups)
+            
+            # 计算偏移均值
+            shift_mean = shift_view.mean(dim=2, keepdim=True)  # [B, 3, 1]
+            
+            # 计算通道均值
+            shift_rgb_mean = shift_mean.mean(dim=1, keepdim=True)  # [B, 1, 1]
+            
+            # 归一化RGB通道偏移量
+            shift_norm = shift_view - (shift_mean - shift_rgb_mean)
+            
+            # 重塑回原始维度
+            shift = shift_norm.view(shift.size(0), -1)
+        
         scale = scale.unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
         shift = shift.unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
         
