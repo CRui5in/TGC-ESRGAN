@@ -23,7 +23,7 @@ from basicsr.losses import build_loss
 import torch.nn as nn
 
 @MODEL_REGISTRY.register()
-class TGSRModel(SRGANModel):
+class TGCESRModel(SRGANModel):
     """文本引导的超分辨率模型
 
     基于SRGANModel，但增加了独立的文本引导网络，可以处理文本描述，
@@ -32,22 +32,22 @@ class TGSRModel(SRGANModel):
 
     def __init__(self, opt):
         self.use_text_features = True
-        super(TGSRModel, self).__init__(opt)
+        super(TGCESRModel, self).__init__(opt)
         
         # 初始化日志记录器
         self.logger = get_root_logger()
         
-        self.jpeger = DiffJPEG(differentiable=False).cuda()  # 模拟JPEG压缩
-        self.usm_sharpener = USMSharp().cuda()  # USM锐化
+        self.jpeger = DiffJPEG(differentiable=False).cuda()
+        self.usm_sharpener = USMSharp().cuda()
         self.queue_size = opt.get('queue_size', 180)
         
-        # 初始化文本相关组件
         if self.use_text_features:
             self.init_text_encoder()
             self.init_text_guidance_losses()
         
-        # 存储注意力图
         self.attention_maps = None
+        
+        self.control_map = None
     
     def init_training_settings(self):
         """重写init_training_settings，确保文本引导网络在setup_optimizers之前被初始化"""
@@ -56,16 +56,24 @@ class TGSRModel(SRGANModel):
             self.init_text_guidance_net()
         
         # 调用父类的初始化训练设置
-        super(TGSRModel, self).init_training_settings()
+        super(TGCESRModel, self).init_training_settings()
+        
+        logger = get_root_logger()
+        
+        # 初始化CLIP语义损失
+        train_opt = self.opt['train']
+        if self.is_train and 'clip_opt' in train_opt:
+            self.cri_clip = build_loss(train_opt['clip_opt']).to(self.device)
+            logger.info(f'初始化CLIP语义损失: {train_opt["clip_opt"]["type"]}')
     
     def init_text_encoder(self):
         """初始化文本编码器（CLIP）"""
         logger = get_root_logger()
         
         text_encoder_opt = self.opt.get('text_encoder', {})
-        self.text_encoder_name = text_encoder_opt.get('name', None)
+        self.text_encoder_name = text_encoder_opt.get('name')
         self.text_dim = text_encoder_opt.get('text_dim', 512)
-        self.freeze_text_encoder = text_encoder_opt.get('freeze', True)
+        self.freeze_text_encoder = text_encoder_opt.get('freeze')
         
         # 加载CLIP文本编码器
         if self.text_encoder_name:
@@ -74,14 +82,12 @@ class TGSRModel(SRGANModel):
                 self.clip_tokenizer = CLIPTokenizer.from_pretrained(self.text_encoder_name)
                 self.clip_text_encoder = CLIPTextModel.from_pretrained(self.text_encoder_name)
                 
-                # 冻结文本编码器参数（如果需要）
                 if self.freeze_text_encoder:
                     logger.info('冻结文本编码器参数')
                     for param in self.clip_text_encoder.parameters():
                         param.requires_grad = False
                     self.clip_text_encoder.eval()
                 
-                # 移动到GPU
                 self.clip_text_encoder = self.clip_text_encoder.to(self.device)
                 logger.info(f'成功加载文本编码器: {self.text_encoder_name}')
             except Exception as e:
@@ -91,126 +97,346 @@ class TGSRModel(SRGANModel):
                 self.use_text_features = False
     
     def init_text_guidance_net(self):
-        """初始化文本引导网络"""
+        """初始化ControlNet"""
         if not self.use_text_features:
             return
             
         logger = get_root_logger()
         
         try:
-            # 检查配置是否存在
-            if 'network_t' not in self.opt:
-                logger.error("配置中缺少network_t参数")
-                raise ValueError("配置中缺少network_t参数")
+            if 'network_control' not in self.opt:
+                logger.error("配置中缺少network_control参数")
+                raise ValueError("配置中缺少network_control参数")
             
-            # 构建文本引导网络
-            self.net_t = build_network(self.opt['network_t'])
+            # 初始化ControlNet
+            logger.info("使用ControlNet架构进行训练")
+            # 创建ControlNet，传入SR网络的副本
+            self.opt['network_control']['orig_net_g'] = self.net_g  # 传递原始网络给ControlNet
+            self.net_control = build_network(self.opt['network_control'])
             
             # 设置参数为可训练
-            for param in self.net_t.parameters():
+            for param in self.net_control.parameters():
                 param.requires_grad = True
             
-            # 移动到设备
-            self.net_t = self.model_to_device(self.net_t)
+            # 将SR网络设置为评估模式并冻结参数（标准ControlNet要求）
+            if self.opt.get('freeze_original'):
+                logger.info("已冻结原始SR网络参数")
+                self.net_g.eval()
+                for param in self.net_g.parameters():
+                    param.requires_grad = False
+            else:
+                logger.warning("原始SR网络未冻结，这不是标准ControlNet实现")
             
-            # 打印网络结构
-            self.print_network(self.net_t)
+            self.net_control = self.model_to_device(self.net_control)
             
-            # 加载预训练权重（如果有）
-            load_path = self.opt['path'].get('pretrain_network_t', None)
-            if load_path is not None:
-                param_key = self.opt['path'].get('param_key_t', 'params')
-                self.load_network(self.net_t, load_path, self.opt['path'].get('strict_load_t', True), param_key)
+            self.print_network(self.net_control)
             
-            self.net_t.train()
-            return True
+            if hasattr(self.net_control, 'load_pretrained_controlnet'):
+                canny_path = self.opt.get('pretrain_canny_model')
+                depth_path = self.opt.get('pretrain_depth_model')
+                
+                if canny_path or depth_path:
+                    logger.info(f"加载预训练ControlNet模型 - Canny: {canny_path}, Depth: {depth_path}")
+                    self.net_control.load_pretrained_controlnet(canny_path, depth_path)
+            
+            self.net_control.train()
+            logger.info("ControlNet初始化成功！")
+            
+            return hasattr(self, 'net_control')
             
         except Exception as e:
-            logger.error(f"初始化文本引导网络失败: {e}")
+            logger.error(f"初始化ControlNet失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return False
-
+    
     def init_text_guidance_losses(self):
-        """初始化文本引导网络的特定损失函数"""
+        """初始化ControlNet的特定损失函数"""
         logger = get_root_logger()
         train_opt = self.opt['train']
         
-        if 'cri_control' in train_opt:
-            cri_control_opt = train_opt['cri_control']
-            self.cri_control = build_loss(cri_control_opt).to(self.device)
-            logger.info(f'初始化控制特征损失: {cri_control_opt["type"]}')
-        
-        if 'cri_attention' in train_opt:
-            cri_attention_opt = train_opt['cri_attention']
-            self.cri_attention = build_loss(cri_attention_opt).to(self.device)
-            logger.info(f'初始化文本区域监督注意力损失: {cri_attention_opt["type"]}')
-        
         # 特征投影层，用于投影特征到文本空间维度
         if hasattr(self, 'text_dim'):
-            feat_dim = train_opt.get('feat_dim', 64)  # 默认特征维度
+            feat_dim = train_opt.get('feat_dim', 64)
             if feat_dim != self.text_dim:
                 self.feat_proj = nn.Linear(feat_dim, self.text_dim).to(self.device)
                 logger.info(f'创建特征投影层: {feat_dim} -> {self.text_dim}')
 
     def setup_optimizers(self):
-        """设置优化器，包括SR网络和文本引导网络"""
+        """设置优化器，支持ControlNet训练模式"""
+        logger = get_root_logger()
         train_opt = self.opt['train']
         
-        # 优化器G - 超分辨率网络
-        optim_params_g = []
-        for k, v in self.net_g.named_parameters():
-            if v.requires_grad:
-                optim_params_g.append(v)
+        # 获取初始学习率（从第一个阶段或默认值）
+        init_lr_g = train_opt['stages'][0]['lr_g'] if train_opt.get('stage_train') and 'stages' in train_opt else 1e-4
+        init_lr_d = train_opt['stages'][0]['lr_d'] if train_opt.get('stage_train') and 'stages' in train_opt else 1e-4
+        init_lr_control = train_opt['stages'][0].get('lr_control', 1e-4) if train_opt.get('stage_train') and 'stages' in train_opt else 1e-4
         
-        # 注意：使用copy避免修改原始配置
-        optim_g_config = train_opt['optim_g'].copy()
-        optim_type = optim_g_config.pop('type')
-        self.optimizer_g = self.get_optimizer(optim_type, optim_params_g, **optim_g_config)
-        self.optimizers.append(self.optimizer_g)
+        # 检查是否使用ControlNet模式
+        use_controlnet = hasattr(self, 'net_control')
         
-        # 优化器D - 判别器
-        # 注意：使用copy避免修改原始配置
+        # 清空优化器列表，避免重复添加
+        self.optimizers = []
+        
+        # 根据配置选择是否冻结SR网络
+        freeze_original = self.opt.get('freeze_original', True)
+        if freeze_original:
+            logger.info("根据配置冻结原始SR网络")
+            self.net_g.eval()
+            for param in self.net_g.parameters():
+                param.requires_grad = False
+        
+        # ==================== 优化器D - 判别器 ====================
+        logger.info("设置判别器优化器")
         optim_d_config = train_opt['optim_d'].copy()
         optim_type = optim_d_config.pop('type')
-        self.optimizer_d = self.get_optimizer(optim_type, self.net_d.parameters(), **optim_d_config)
+        # 从配置中移除lr字段，使用阶段学习率
+        if 'lr' in optim_d_config:
+            optim_d_config.pop('lr')
+        self.optimizer_d = self.get_optimizer(optim_type, self.net_d.parameters(), lr=init_lr_d, **optim_d_config)
         
         # 添加这一行，确保每个参数组都有initial_lr参数
         for param_group in self.optimizer_d.param_groups:
             param_group['initial_lr'] = param_group['lr']
         
         # 更新优化器列表
-        if len(self.optimizers) > 1:
-            self.optimizers[1] = self.optimizer_d
+        self.optimizers.append(self.optimizer_d)
         
-        # 优化器T - 文本引导网络（如果使用）
-        if self.use_text_features and hasattr(self, 'net_t'):
-            if 'optim_t' in train_opt:
-                # 收集可训练参数
-                optim_params_t = []
-                for k, v in self.net_t.named_parameters():
+        # ==================== 优化器Control - ControlNet ====================
+        # ControlNet优化器
+        if use_controlnet:
+            logger.info("设置ControlNet优化器")
+            # 为ControlNet创建独立优化器
+            if 'optim_control' in train_opt:
+                optim_config = train_opt['optim_control'].copy()
+                optim_type = optim_config.pop('type')
+                
+                # 从配置中移除lr字段，使用阶段学习率
+                if 'lr' in optim_config:
+                    optim_config.pop('lr')
+                
+                # 收集ControlNet参数
+                optim_params_control = []
+                for k, v in self.net_control.named_parameters():
                     if v.requires_grad:
-                        optim_params_t.append(v)
+                        optim_params_control.append(v)
                 
                 # 文本编码器参数（如果未冻结）
                 if hasattr(self, 'clip_text_encoder') and not self.freeze_text_encoder:
                     for k, v in self.clip_text_encoder.named_parameters():
                         if v.requires_grad:
-                            optim_params_t.append(v)
+                            optim_params_control.append(v)
                 
-                # 注意：使用copy避免修改原始配置
-                optim_t_config = train_opt['optim_t'].copy()
-                optim_type = optim_t_config.pop('type')
-                
-                # 保存配置用于可能的重新创建
-                self._optim_t_config = {
+                # 保存配置
+                self._optim_control_config = {
                     'type': optim_type,
-                    **optim_t_config
+                    **optim_config
                 }
                 
-                if optim_params_t:
-                    self.optimizer_t = self.get_optimizer(optim_type, optim_params_t, **optim_t_config)
-                    self.optimizers.append(self.optimizer_t)
+                if optim_params_control:
+                    self.optimizer_control = self.get_optimizer(optim_type, optim_params_control, lr=init_lr_control, **optim_config)
+                    # 确保每个参数组都有initial_lr参数
+                    for param_group in self.optimizer_control.param_groups:
+                        param_group['initial_lr'] = param_group['lr']
+                    self.optimizers.append(self.optimizer_control)
+                    
+        # 记录优化器设置完成
+        logger.info(f"优化器设置完成，共有 {len(self.optimizers)} 个优化器")
+
+    def optimize_parameters(self, current_iter):
+        """优化参数，整合SR网络和ControlNet"""
+        logger = get_root_logger()
+        # 保存当前迭代次数
+        self.iter = current_iter
+        
+        # 检查使用的架构类型
+        use_controlnet = hasattr(self, 'net_control') and hasattr(self, 'optimizer_control')
+        
+        # 检查是否处于阶段转换点
+        if self.opt['train'].get('stage_train'):
+            self.current_stage_idx = 0
+            
+            # 计算每个阶段的起始点
+            accumulated_iters = 0
+            for idx, stage in enumerate(self.opt['train']['stages']):
+                start_iter = accumulated_iters
+                accumulated_iters += stage['iters']
+                end_iter = accumulated_iters
+                
+                # 如果当前迭代在这个阶段的范围内，设置当前阶段索引
+                if start_iter <= current_iter < end_iter:
+                    self.current_stage_idx = idx
+                    
+                # 检查是否精确处于阶段切换点（前一阶段的结束=当前阶段的开始）
+                if idx > 0 and current_iter == start_iter:
+                    logger.info(f'进入阶段 {stage["name"]} 在迭代 {current_iter}')
+                    
+                    # 设置学习率 - 只设置判别器和ControlNet的学习率
+                    for param_group in self.optimizer_d.param_groups:
+                        param_group['lr'] = stage['lr_d']
+                        param_group['initial_lr'] = stage['lr_d']
+                    
+                    if use_controlnet:
+                        lr_control = stage.get('lr_control')
+                        for param_group in self.optimizer_control.param_groups:
+                            param_group['lr'] = lr_control
+                            param_group['initial_lr'] = lr_control
+                    
+                    # 对于特定阶段的特殊处理
+                    if idx == 1:  # 从预训练到联合轻度训练阶段
+                        # 重新初始化判别器的某些层参数，避免梯度爆炸
+                        for name, m in self.net_d.named_modules():
+                            if isinstance(m, nn.Conv2d) and 'final' not in name:
+                                nn.init.normal_(m.weight, 0, 0.02)
+        
+        # 定期清理CUDA缓存以减少内存碎片
+        if current_iter % 50 == 0:
+            torch.cuda.empty_cache()
+            
+        # 设置GT图像（带锐化或不带）
+        l1_gt = self.gt_usm if self.opt.get('l1_gt_usm') else self.gt
+        percep_gt = self.gt_usm if self.opt.get('percep_gt_usm') else self.gt
+        gan_gt = self.gt_usm if self.opt.get('gan_gt_usm') else self.gt
+        
+        # ====================== 第1部分：优化生成器 ======================
+        # 关闭判别器梯度
+        for p in self.net_d.parameters():
+            p.requires_grad = False
+
+        # 清零梯度 - 只清除ControlNet的梯度
+        if use_controlnet:
+            self.optimizer_control.zero_grad()
+        
+        # 前向传播，应用文本引导 - 确保output依赖于control_signals以维持梯度流
+        self.output = self.forward_sr_network(self.lq, apply_guidance=True)
+
+        l_g_total = 0
+        loss_dict = OrderedDict()
+        
+        # 像素损失
+        if self.cri_pix:
+            l_g_pix = self.cri_pix(self.output, l1_gt)
+            l_g_total += l_g_pix
+            loss_dict['l_g_pix'] = l_g_pix
+            
+        # 感知损失
+        if self.cri_perceptual:
+            l_g_percep, l_g_style = self.cri_perceptual(self.output, percep_gt)
+            if l_g_percep is not None:
+                l_g_total += l_g_percep
+                loss_dict['l_g_percep'] = l_g_percep
+            if l_g_style is not None:
+                l_g_total += l_g_style
+                loss_dict['l_g_style'] = l_g_style
+                
+        # GAN损失
+        fake_g_pred = self.net_d(self.output)
+        l_g_gan = self.cri_gan(fake_g_pred, True, is_disc=False)
+        
+        # 调整GAN损失权重
+        gan_weight = self.opt.get('train', {}).get('gan_weight', 0.1)
+        l_g_total += l_g_gan * gan_weight
+        loss_dict['l_g_gan'] = l_g_gan
+        loss_dict['l_g_gan_weighted'] = l_g_gan * gan_weight  # 记录加权后的损失值
+
+        # 新增：CLIP语义损失 - 确保生成图像与文本描述的语义一致性
+        if hasattr(self, 'cri_clip') and self.use_text_features:
+            l_clip = self.cri_clip(self.output, self.text_prompts)
+            
+            # 调整CLIP损失权重
+            clip_weight = self.opt.get('train', {}).get('clip_weight', 0.3)
+            l_g_total += l_clip * clip_weight
+            loss_dict['l_clip'] = l_clip
+            loss_dict['l_clip_weighted'] = l_clip * clip_weight  # 记录加权后的损失值
+            
+            # 动态调整CLIP权重 - 防止在训练早期占比过大
+            if hasattr(self, 'iter'):
+                current_iter = self.iter
+                if current_iter < 20000:  # 前20k次迭代降低CLIP损失权重
+                    clip_scale = current_iter / 20000.0  # 从0逐渐增加到1.0
+                    l_g_total -= l_clip * clip_weight * (1.0 - clip_scale)  # 减少一部分权重
+                    loss_dict['clip_scale'] = clip_scale
+        
+        # 反向传播
+        if l_g_total.requires_grad:
+            l_g_total.backward()
+            
+            # 检查net_control参数是否有梯度
+            if use_controlnet:
+                has_grad = False
+                for name, param in self.net_control.named_parameters():
+                    if param.grad is not None and param.grad.abs().sum() > 0:
+                        has_grad = True
+                        break
+            
+            # 梯度裁剪，防止梯度爆炸
+            if use_controlnet:
+                torch.nn.utils.clip_grad_norm_(self.net_control.parameters(), max_norm=10.0)
+                
+            # 更新ControlNet参数
+            if use_controlnet:
+                self.optimizer_control.step()
+        else:
+            logger.error("生成器总损失没有梯度，跳过反向传播")
+        
+        # 清理GPU内存
+        if hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
+        
+        # ====================== 第3部分：判别器更新 ======================
+        # 判别器跳过条件 - 可以根据阶段自定义
+        skip_d_update = False
+        current_stage_idx = 0
+        
+        # 获取当前所处阶段
+        if self.opt['train'].get('stage_train'):
+            stages = self.opt['train']['stages']
+            for idx, stage in enumerate(stages):
+                if current_iter < stage['iters'] or idx == len(stages) - 1 and current_iter >= stage['iters']:
+                    current_stage_idx = idx
+                    break
+        
+        # 在预训练阶段可能需要跳过判别器更新
+        if current_stage_idx == 0 and self.opt['train'].get('stage_train'):
+            first_stage = self.opt['train']['stages'][0]
+            if first_stage.get('lr_d', 0) == 0:
+                skip_d_update = True
+        
+        # 优化判别器（除非需要跳过）
+        if not skip_d_update:
+            for p in self.net_d.parameters():
+                p.requires_grad = True
+
+            self.optimizer_d.zero_grad()
+            # 真实样本
+            real_d_pred = self.net_d(gan_gt)
+            l_d_real = self.cri_gan(real_d_pred, True, is_disc=True)
+            loss_dict['l_d_real'] = l_d_real
+            loss_dict['out_d_real'] = torch.mean(real_d_pred.detach())
+            l_d_real.backward()
+            
+            # 虚假样本
+            fake_d_pred = self.net_d(self.output.detach())
+            l_d_fake = self.cri_gan(fake_d_pred, False, is_disc=True)
+            loss_dict['l_d_fake'] = l_d_fake
+            loss_dict['out_d_fake'] = torch.mean(fake_d_pred.detach())
+            l_d_fake.backward()
+            
+            # 可选：添加判别器更新跳过逻辑，当判别器过强时
+            fake_score = torch.mean(fake_d_pred.detach()).item()
+            real_score = torch.mean(real_d_pred.detach()).item()
+            discriminator_too_strong = fake_score < 0.4 and real_score > 0.7
+            
+            # 如果判别器不是过强，则更新参数
+            if not discriminator_too_strong or current_iter % 5 == 0:  # 每5次迭代至少更新一次
+                self.optimizer_d.step()
+        
+        # 记录损失
+        self.log_dict = loss_dict
+        
+        # 更新EMA模型
+        if self.ema_decay > 0:
+            self.model_ema(decay=self.ema_decay)
     
     def encode_text(self, text_prompts):
         """编码文本提示"""
@@ -313,11 +539,20 @@ class TGSRModel(SRGANModel):
     @torch.no_grad()
     def feed_data(self, data):
         """接收数据并添加二阶退化以获得低质量图像"""
+        # TODO: 现在是使用的先退化再缩放，和RealESRGAN的先缩放再退化不一样
         # 存储文本提示
         if self.use_text_features and 'text_prompt' in data:
             self.text_prompts = data['text_prompt']
         else:
             self.text_prompts = [''] * len(data['gt'] if 'gt' in data else data['lq'])
+        
+        # 存储控制映射
+        if 'control_map' in data:
+            # 临时存储原始控制映射
+            raw_control_map = data['control_map'].to(self.device)
+            
+            # 稍后在处理lq后再调整控制映射尺寸
+            self.raw_control_map = raw_control_map
         
         # 解码对象信息（如果有）
         self.objects_info = None
@@ -330,12 +565,13 @@ class TGSRModel(SRGANModel):
                     batch_objects.append(json.loads(obj_str))
                 self.objects_info = batch_objects
             except Exception as e:
-                logger = get_root_logger()
-                logger.warning(f"解析对象信息失败: {e}")
+                logger = get_root_logger() if hasattr(self, 'logger') else None
+                if logger:
+                    logger.warning(f"解析对象信息失败: {e}")
                 self.objects_info = None
         
-        if self.is_train and self.opt.get('high_order_degradation', True):
-            # 训练数据合成 - 严格遵循RealESRGAN方式
+        if self.is_train:
+            # 训练数据合成 - 修改为先退化再缩放
             self.gt = data['gt'].to(self.device)
             self.gt_usm = self.usm_sharpener(self.gt)
 
@@ -348,17 +584,6 @@ class TGSRModel(SRGANModel):
             # ----------------------- 第一阶段退化过程 ----------------------- #
             # 模糊
             out = filter2D(self.gt_usm, self.kernel1)
-            
-            # 随机调整大小
-            updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob'])[0]
-            if updown_type == 'up':
-                scale = np.random.uniform(1, self.opt['resize_range'][1])
-            elif updown_type == 'down':
-                scale = np.random.uniform(self.opt['resize_range'][0], 1)
-            else:
-                scale = 1
-            mode = random.choice(['area', 'bilinear', 'bicubic'])
-            out = F.interpolate(out, scale_factor=scale, mode=mode)
             
             # 添加噪声
             gray_noise_prob = self.opt['gray_noise_prob']
@@ -381,18 +606,6 @@ class TGSRModel(SRGANModel):
             if np.random.uniform() < self.opt['second_blur_prob']:
                 out = filter2D(out, self.kernel2)
                 
-            # 随机调整大小
-            updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob2'])[0]
-            if updown_type == 'up':
-                scale = np.random.uniform(1, self.opt['resize_range2'][1])
-            elif updown_type == 'down':
-                scale = np.random.uniform(self.opt['resize_range2'][0], 1)
-            else:
-                scale = 1
-            mode = random.choice(['area', 'bilinear', 'bicubic'])
-            out = F.interpolate(
-                out, size=(int(ori_h / self.opt['scale'] * scale), int(ori_w / self.opt['scale'] * scale)), mode=mode)
-            
             # 添加噪声
             gray_noise_prob = self.opt['gray_noise_prob2']
             if np.random.uniform() < self.opt['gaussian_noise_prob2']:
@@ -404,28 +617,17 @@ class TGSRModel(SRGANModel):
                     out, scale_range=self.opt['poisson_scale_range2'], 
                     gray_prob=gray_noise_prob, clip=True, rounds=False)
   
-            # JPEG压缩 + 最终sinc滤波器 - 两种顺序
-            if np.random.uniform() < 0.5:
-                # 1. [调整回原尺寸 + sinc滤波] + JPEG压缩
-                mode = random.choice(['area', 'bilinear', 'bicubic'])
-                out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
-                out = filter2D(out, self.sinc_kernel)
-                
-                # JPEG压缩
-                jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range2'])
-                out = torch.clamp(out, 0, 1)
-                out = self.jpeger(out, quality=jpeg_p)
-            else:
-                # 2. JPEG压缩 + [调整回原尺寸 + sinc滤波]
-                # JPEG压缩
-                jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range2'])
-                out = torch.clamp(out, 0, 1)
-                out = self.jpeger(out, quality=jpeg_p)
-                    
-                # 调整回原尺寸
-                mode = random.choice(['area', 'bilinear', 'bicubic'])
-                out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
-                out = filter2D(out, self.sinc_kernel)
+            # JPEG压缩
+            jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range2'])
+            out = torch.clamp(out, 0, 1)
+            out = self.jpeger(out, quality=jpeg_p)
+            
+            # 最终的sinc滤波
+            out = filter2D(out, self.sinc_kernel)
+            
+            # 在完成所有退化后再进行缩放 - 先退化再缩放
+            mode = random.choice(['area', 'bilinear', 'bicubic'])
+            out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
             
             # clamp and round
             self.lq = torch.clamp((out * 255.0).round(), 0, 255) / 255.
@@ -439,6 +641,32 @@ class TGSRModel(SRGANModel):
             if self.gt.size(2) != gt_h or self.gt.size(3) != gt_w:
                 self.gt = F.interpolate(self.gt, size=(gt_h, gt_w), mode='bicubic')
                 self.gt_usm = F.interpolate(self.gt_usm, size=(gt_h, gt_w), mode='bicubic')
+            
+            # ----------------------- 处理控制映射 ----------------------- #
+            # 调整控制映射大小，确保与lq大小一致
+            if hasattr(self, 'raw_control_map') and self.raw_control_map is not None:
+                lq_h, lq_w = self.lq.shape[2:4]
+                raw_h, raw_w = self.raw_control_map.shape[2:4]
+                
+                if raw_h != lq_h or raw_w != lq_w:
+                    # 判断是单通道还是多通道控制映射
+                    is_multi_channel = self.raw_control_map.shape[1] > 1
+                    
+                    # 使用不同的插值模式
+                    interp_mode = 'bilinear' if is_multi_channel else 'nearest'
+                    align_corners = False if is_multi_channel else None
+                    
+                    self.control_map = F.interpolate(
+                        self.raw_control_map, 
+                        size=(lq_h, lq_w), 
+                        mode=interp_mode,
+                        align_corners=align_corners if interp_mode == 'bilinear' else None
+                    )
+                else:
+                    self.control_map = self.raw_control_map
+                
+                # 清理临时变量
+                del self.raw_control_map
             
             # 训练数据队列
             self._dequeue_and_enqueue()
@@ -462,6 +690,32 @@ class TGSRModel(SRGANModel):
                     gt_h, gt_w = target_h * self.opt['scale'], target_w * self.opt['scale']
                     self.gt = F.interpolate(self.gt, size=(gt_h, gt_w), mode='bicubic')
                     self.gt_usm = F.interpolate(self.gt_usm, size=(gt_h, gt_w), mode='bicubic')
+            
+            # ----------------------- 处理控制映射 ----------------------- #
+            # 验证/测试模式下调整控制映射大小
+            if hasattr(self, 'raw_control_map') and self.raw_control_map is not None:
+                lq_h, lq_w = self.lq.shape[2:4]
+                raw_h, raw_w = self.raw_control_map.shape[2:4]
+                
+                if raw_h != lq_h or raw_w != lq_w:
+                    # 判断是单通道还是多通道控制映射
+                    is_multi_channel = self.raw_control_map.shape[1] > 1
+                    
+                    # 使用不同的插值模式
+                    interp_mode = 'bilinear' if is_multi_channel else 'nearest'
+                    align_corners = False if is_multi_channel else None
+                    
+                    self.control_map = F.interpolate(
+                        self.raw_control_map, 
+                        size=(lq_h, lq_w), 
+                        mode=interp_mode,
+                        align_corners=align_corners if interp_mode == 'bilinear' else None
+                    )
+                else:
+                    self.control_map = self.raw_control_map
+                
+                # 清理临时变量
+                del self.raw_control_map
 
     def apply_text_guidance(self, features, text_hidden=None, text_pooled=None, block_idx=None):
         """应用文本引导到特征图
@@ -503,169 +757,545 @@ class TGSRModel(SRGANModel):
         return enhanced_features, attention_logits
     
     def forward_sr_network(self, x, apply_guidance=True):
-        """SR网络的前向传播，使用ControlNet风格的文本引导
+        """SR网络的前向传播，使用ControlNet实现文本引导
         
         Args:
-            x: 输入的低质量图像
+            x: 输入的低质量图像 [B, C, H, W]
             apply_guidance: 是否应用文本引导
             
         Returns:
-            sr: 超分辨率输出
+            sr: 超分辨率输出 [B, C, H*4, W*4]
         """
         # 获取文本特征（如果需要）
-        if self.use_text_features and apply_guidance and hasattr(self, 'net_t'):
+        text_hidden, text_pooled = None, None
+        if self.use_text_features and apply_guidance:
             with torch.no_grad() if self.freeze_text_encoder else torch.enable_grad():
                 text_hidden, text_pooled = self.encode_text(self.text_prompts)
-        else:
-            text_hidden, text_pooled = None, None
+ 
+        # 获取控制映射
+        control_map = getattr(self, 'control_map', None)
+        if control_map is None and apply_guidance:
+            b, c, h, w = x.shape
+            control_map = torch.zeros(b, 3, h, w, device=x.device)
+
+        # 确保控制映射与输入图像尺寸一致
+        if control_map is not None and (control_map.shape[2] != x.shape[2] or control_map.shape[3] != x.shape[3]):
+            # 根据通道数选择合适的插值模式
+            interp_mode = 'bilinear' if control_map.shape[1] > 1 else 'nearest'
+            align_corners = False if interp_mode == 'bilinear' else None
             
-        # 如果不使用文本引导，直接使用原始SR网络
-        if not self.use_text_features or not apply_guidance or text_hidden is None:
+            control_map = F.interpolate(
+                control_map,
+                size=(x.shape[2], x.shape[3]),
+                mode=interp_mode,
+                align_corners=align_corners
+            )
+
+        use_controlnet = hasattr(self, 'net_control') and apply_guidance and text_hidden is not None
+        if not use_controlnet:
             return self.net_g(x)
+
+        # 生成位置编码
+        position_info = None
+        if hasattr(self.net_control, 'with_position') and self.net_control.with_position:
+            num_blocks = len(self.net_g.body)
+            position_info = torch.zeros(x.size(0), num_blocks, device=x.device)
+            for i in range(num_blocks):
+                position_info[:, i] = 1.0 if i % 4 == 0 else 0.0  # 每组RRDB块标记
+
+        # 生成控制信号
+        control_signals, attention_maps = self.net_control(x, control_map, text_hidden, text_pooled, position_info)
+
+        # 校验信号数量
+        block_groups_count = len(self.net_g.body) // 4 + (1 if len(self.net_g.body) % 4 > 0 else 0)
+        expected_signals = block_groups_count + 4  # conv_first, block_groups, conv_body, conv_up1, conv_up2
         
-        # ====================== ControlNet风格的前向传播 ======================
-        # 1. 锁定的前向传播（ControlNet的Locked Copy概念）
-        with torch.no_grad():
-            # 浅层特征提取
-            locked_fea = self.net_g.conv_first(x)
+        if len(control_signals) != expected_signals:
+            error_msg = f"控制信号数量不正确: 预期{expected_signals}个，实际{len(control_signals)}个"
+            raise ValueError(error_msg)
+
+        # 计算自适应控制强度
+        if hasattr(self, 'cri_clip') and self.use_text_features and self.is_train:
+            # 根据训练阶段自适应调整控制强度
+            base_strength = 0.05
+            if hasattr(self, 'iter') and hasattr(self, 'opt') and self.opt.get('train', {}).get('stage_train', False):
+                current_iter = getattr(self, 'iter', 0)
+                # 在早期阶段使用较小的控制强度
+                if current_iter < 20000:
+                    control_strength = base_strength * 0.5
+                # 在中期阶段逐渐增加控制强度
+                elif current_iter < 100000:
+                    progress = (current_iter - 20000) / 80000
+                    control_strength = base_strength * (0.5 + 0.5 * progress)
+                # 在后期阶段使用较大的控制强度
+                else:
+                    control_strength = base_strength * 1.2
+            else:
+                control_strength = base_strength
+        else:
+            # 测试/推理模式使用固定控制强度
+            control_strength = 0.05
+
+        # 应用控制信号到RRDBNet
+        if self.is_train:
+            # 训练模式 - 保持梯度流
+            # 浅层特征提取 - 锁定参数不需要梯度
+            fea = self.net_g.conv_first(x)
             
-            # 分组处理RRDB块，便于更粗粒度的引导
-            locked_features = []
-            locked_trunk = locked_fea
+            signal_idx = 0
+            control_signal = control_signals[signal_idx]
+            if fea.shape[2:] != control_signal.shape[2:]:
+                control_signal = F.interpolate(
+                    control_signal,
+                    size=(fea.shape[2], fea.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+            fea_guided = fea + control_signal
             
-            # RRDB块分组（每4个为一组）
+            # 分组处理RRDB块
+            trunk = fea_guided
             block_groups = []
             total_blocks = len(self.net_g.body)
-            group_size = 4  # 可根据总块数调整
+            group_size = 4
             
+            # 处理RRDB块并应用控制信号
             for i in range(0, total_blocks, group_size):
                 end = min(i + group_size, total_blocks)
-                block_groups.append(self.net_g.body[i:end])
-            
-            # 处理每个块组
-            for group in block_groups:
-                for block in group:
-                    locked_trunk = block(locked_trunk)
-                locked_features.append(locked_trunk.clone())
-            
-            # 主干结束的特征
-            locked_body_out = self.net_g.conv_body(locked_trunk)
-            locked_features.append(locked_body_out)
-            
-            # 上采样和最终输出的特征
-            locked_up1 = self.net_g.conv_up1(F.interpolate(locked_body_out + locked_fea, scale_factor=2, mode='nearest'))
-            locked_up2 = self.net_g.conv_up2(F.interpolate(locked_up1, scale_factor=2, mode='nearest'))
-            
-        # 2. 使用文本引导网络生成控制信号 - ControlNet的核心思想
-        # 准备空间上的文本控制
-        guided_features, attention_maps = self.net_t(locked_features[0], text_hidden, text_pooled)
-        
-        # 3. 应用控制信号和特征融合 
-        # 注：与ControlNet类似，这里我们从锁定特征开始，逐步应用控制
-        fea = self.net_g.conv_first(x)
-        trunk = fea
-        
-        # 处理主干
-        num_groups = len(block_groups)
-        for i, group in enumerate(block_groups):
-            # 处理每个块
-            for block in group:
-                trunk = block(trunk)
-            
-            # 在每个组结束后应用控制 - 如果有足够的控制特征
-            if i < len(attention_maps):
-                # 获取当前注意力图和控制强度
-                attn = torch.sigmoid(attention_maps[i])
-                # 自适应强度控制 - 训练开始时较低，随着训练进行逐渐增强
-                if self.is_train:
-                    # 使用更保守的控制强度
-                    control_strength = 0.5  # 降低固定强度值
-                else:
-                    control_strength = 0.5  # 测试时使用中等强度
+                block_group = self.net_g.body[i:end]
                 
-                # 应用控制 - trunk是变化的特征，locked_features[i]是锁定的参考特征
-                # guided_features提供从锁定特征到修改后特征的映射
-                control_signal = guided_features - locked_features[i]
+                # 使用冻结参数处理RRDB块
+                for block in block_group:
+                    trunk = block(trunk)
                 
-                # 简单的幅值限制，防止控制信号过大导致不稳定
-                with torch.no_grad():
-                    max_val = torch.max(torch.abs(control_signal))
-                    if max_val > 5.0:
-                        scale_factor = 5.0 / max_val
-                    else:
-                        scale_factor = 1.0
+                signal_idx += 1
+                attn = torch.sigmoid(attention_maps[signal_idx])
                 
-                control_signal = control_signal * scale_factor
+                control_signal = control_signals[signal_idx]
+                if trunk.shape[2:] != control_signal.shape[2:]:
+                    control_signal = F.interpolate(
+                        control_signal,
+                        size=(trunk.shape[2], trunk.shape[3]),
+                        mode='bilinear',
+                        align_corners=False
+                    )
                 
-                # 应用控制信号 - 使用原始注意力值
+                if trunk.shape[2:] != attn.shape[2:]:
+                    b, c, _, _ = attn.shape
+                    attn = F.interpolate(
+                        attn,
+                        size=(trunk.shape[2], trunk.shape[3]),
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                    if attn.shape[1] != c:
+                        attn = attn[:, :c]
+                
                 trunk = trunk + control_strength * control_signal * attn
+            
+            # 处理主体输出
+            trunk = self.net_g.conv_body(trunk)
+            
+            # 应用主体输出的控制信号
+            signal_idx += 1
+            attn = torch.sigmoid(attention_maps[signal_idx])
+            
+            control_signal = control_signals[signal_idx]
+            if trunk.shape[2:] != control_signal.shape[2:]:
+                control_signal = F.interpolate(
+                    control_signal,
+                    size=(trunk.shape[2], trunk.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+            
+            if trunk.shape[2:] != attn.shape[2:]:
+                b, c, _, _ = attn.shape
+                attn = F.interpolate(
+                    attn,
+                    size=(trunk.shape[2], trunk.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                if attn.shape[1] != c:
+                    attn = attn[:, :c]
+            
+            trunk = trunk + control_strength * control_signal * attn
+            
+            # 残差连接
+            fea = fea_guided + trunk
+            
+            # 上采样阶段1
+            fea = F.interpolate(fea, scale_factor=2, mode='nearest')
+            fea = self.net_g.conv_up1(fea)
+            
+            # 应用第一个上采样层的控制信号
+            signal_idx += 1
+            attn = torch.sigmoid(attention_maps[signal_idx])
+            
+            control_signal = control_signals[signal_idx]
+            if fea.shape[2:] != control_signal.shape[2:]:
+                control_signal = F.interpolate(
+                    control_signal,
+                    size=(fea.shape[2], fea.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+            
+            # 检查注意力图尺寸是否匹配
+            if fea.shape[2:] != attn.shape[2:]:
+                b, c, _, _ = attn.shape
+                attn = F.interpolate(
+                    attn,
+                    size=(fea.shape[2], fea.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                if attn.shape[1] != c:
+                    attn = attn[:, :c]
+            
+            fea = fea + control_strength * 1.5 * control_signal * attn  # 增加上采样层控制强度
+            
+            # 上采样阶段2
+            fea = F.interpolate(fea, scale_factor=2, mode='nearest')
+            fea = self.net_g.conv_up2(fea)
+            
+            # 应用第二个上采样层的控制信号
+            signal_idx += 1
+            attn = torch.sigmoid(attention_maps[signal_idx])
+            
+            control_signal = control_signals[signal_idx]
+            if fea.shape[2:] != control_signal.shape[2:]:
+                control_signal = F.interpolate(
+                    control_signal,
+                    size=(fea.shape[2], fea.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+            
+            if fea.shape[2:] != attn.shape[2:]:
+                b, c, _, _ = attn.shape
+                attn = F.interpolate(
+                    attn,
+                    size=(fea.shape[2], fea.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                if attn.shape[1] != c:
+                    attn = attn[:, :c]
+            
+            fea = fea + control_strength * 1.5 * control_signal * attn  # 增加上采样层控制强度
+            
+            # 最终输出层
+            out = self.net_g.conv_hr(fea)
+            out = self.net_g.conv_last(out)
+            
+            # 添加小的控制信号连接以确保梯度流
+            out = out + 0.0001 * (control_signals[0].sum() + control_signals[-1].sum())
+        else:
+            # 验证/测试模式 - 不需要保持梯度流
+            # 浅层特征提取
+            fea = self.net_g.conv_first(x)
+            
+            # 添加第一个控制信号
+            signal_idx = 0
+            control_signal = control_signals[signal_idx]
+            if fea.shape[2:] != control_signal.shape[2:]:
+                control_signal = F.interpolate(
+                    control_signal,
+                    size=(fea.shape[2], fea.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+            fea = fea + control_signal
+            
+            # 分组处理RRDB块
+            trunk = fea
+            block_groups = []
+            total_blocks = len(self.net_g.body)
+            group_size = 4
+            
+            # 处理RRDB块并应用控制信号
+            for i in range(0, total_blocks, group_size):
+                end = min(i + group_size, total_blocks)
+                block_group = self.net_g.body[i:end]
+                
+                # 处理RRDB块
+                for block in block_group:
+                    trunk = block(trunk)
+                
+                # 应用控制信号
+                signal_idx += 1
+                attn = torch.sigmoid(attention_maps[signal_idx])
+                
+                control_signal = control_signals[signal_idx]
+                if trunk.shape[2:] != control_signal.shape[2:]:
+                    control_signal = F.interpolate(
+                        control_signal,
+                        size=(trunk.shape[2], trunk.shape[3]),
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                
+                if trunk.shape[2:] != attn.shape[2:]:
+                    b, c, _, _ = attn.shape
+                    attn = F.interpolate(
+                        attn,
+                        size=(trunk.shape[2], trunk.shape[3]),
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                    if attn.shape[1] != c:
+                        attn = attn[:, :c]
+                
+                trunk = trunk + control_strength * control_signal * attn
+            
+            # 处理主体输出
+            trunk = self.net_g.conv_body(trunk)
+            
+            # 应用主体输出的控制信号
+            signal_idx += 1
+            attn = torch.sigmoid(attention_maps[signal_idx])
+            
+            control_signal = control_signals[signal_idx]
+            if trunk.shape[2:] != control_signal.shape[2:]:
+                control_signal = F.interpolate(
+                    control_signal,
+                    size=(trunk.shape[2], trunk.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+            
+            if trunk.shape[2:] != attn.shape[2:]:
+                b, c, _, _ = attn.shape
+                attn = F.interpolate(
+                    attn,
+                    size=(trunk.shape[2], trunk.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                if attn.shape[1] != c:
+                    attn = attn[:, :c]
+            
+            trunk = trunk + control_strength * control_signal * attn
+            
+            # 残差连接
+            fea = fea + trunk
+            
+            # 上采样阶段1
+            fea = F.interpolate(fea, scale_factor=2, mode='nearest')
+            fea = self.net_g.conv_up1(fea)
+            
+            # 应用第一个上采样层的控制信号
+            signal_idx += 1
+            attn = torch.sigmoid(attention_maps[signal_idx])
+            
+            control_signal = control_signals[signal_idx]
+            if fea.shape[2:] != control_signal.shape[2:]:
+                control_signal = F.interpolate(
+                    control_signal,
+                    size=(fea.shape[2], fea.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+            
+            if fea.shape[2:] != attn.shape[2:]:
+                b, c, _, _ = attn.shape
+                attn = F.interpolate(
+                    attn,
+                    size=(fea.shape[2], fea.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                if attn.shape[1] != c:
+                    attn = attn[:, :c]
+            
+            fea = fea + control_strength * 1.5 * control_signal * attn
+            
+            # 上采样阶段2
+            fea = F.interpolate(fea, scale_factor=2, mode='nearest')
+            fea = self.net_g.conv_up2(fea)
+            
+            # 应用第二个上采样层的控制信号
+            signal_idx += 1
+            attn = torch.sigmoid(attention_maps[signal_idx])
+            
+            control_signal = control_signals[signal_idx]
+            if fea.shape[2:] != control_signal.shape[2:]:
+                control_signal = F.interpolate(
+                    control_signal,
+                    size=(fea.shape[2], fea.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+            
+            if fea.shape[2:] != attn.shape[2:]:
+                b, c, _, _ = attn.shape
+                attn = F.interpolate(
+                    attn,
+                    size=(fea.shape[2], fea.shape[3]),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                if attn.shape[1] != c:
+                    attn = attn[:, :c]
+            
+            fea = fea + control_strength * 1.5 * control_signal * attn
+            
+            # 最终输出层
+            out = self.net_g.conv_hr(fea)
+            out = self.net_g.conv_last(out)
         
-        # 处理主干结束
-        trunk = self.net_g.conv_body(trunk)
-        fea = fea + trunk
-        
-        # 上采样和最终输出
-        fea = self.net_g.conv_up1(F.interpolate(fea, scale_factor=2, mode='nearest'))
-        fea = self.net_g.conv_up2(F.interpolate(fea, scale_factor=2, mode='nearest'))
-        out = self.net_g.conv_hr(fea)
-        out = self.net_g.conv_last(out)
-        
-        # 保存注意力图用于可视化
+        # 保存注意力图
         self.attention_maps = attention_maps
         
         return out
     
     def nondist_validation(self, dataloader, current_iter, tb_logger, save_img):
-        """验证过程，修改为直接使用高分辨率图像验证SR结果，并增加文本引导可视化"""
-        # 禁用数据合成过程
+        """验证过程，修改为和训练模式一样退化流程进行测试，有对比图，热力图，ControlMap可视化"""
         self.is_train = False
         
         dataset_name = dataloader.dataset.opt['name']
         with_metrics = self.opt['val'].get('metrics') is not None
         
-        # 初始化最佳指标结果
         if with_metrics:
             if not hasattr(self, 'metric_results'):
                 self.metric_results = {metric: 0 for metric in self.opt['val']['metrics'].keys()}
             self._initialize_best_metric_results(dataset_name)
-            # 重置指标结果
             self.metric_results = {metric: 0 for metric in self.metric_results}
         
         # 创建结果目录
         save_path_root = self.opt['path']['visualization']
         if save_img and not osp.exists(save_path_root):
             os.makedirs(save_path_root, exist_ok=True)
-        # if self.opt.get('val', {}).get('save_attention_maps', False):
-        #     os.makedirs(osp.join(save_path_root, 'attention'), exist_ok=True)
+        # 创建注意力图和控制映射目录
+        if self.opt.get('val', {}).get('save_control_maps', False):
+            os.makedirs(osp.join(save_path_root, 'control_maps'), exist_ok=True)
         
-        # 添加计数器，限制只测试前1000张图片
+        # 添加计数器，限制只测试前50张图片
         test_count = 0
-        max_test_samples = 1000
+        max_test_samples = 50
         
         for idx, val_data in enumerate(dataloader):
-            # 检查是否已经测试了1000张图片
+            # 检查是否已经测试了设定数量的图片
             if test_count >= max_test_samples:
                 break
             
             test_count += 1
             
-            # 获取文本提示（如果有）
             if 'text_prompt' in val_data:
                 self.text_prompts = val_data['text_prompt']
             else:
-                self.text_prompts = [''] * len(val_data['gt'])
+                raise ValueError("没有提供文本提示")
             
-            # 设置图像数据
             if 'lq' in val_data:
-                # 使用提供的低质量图像
+                # TODO: 这里应该不会出现这种情况，因为没配置LQ数据集，可以删掉
                 self.lq = val_data['lq'].to(self.device)
             elif 'gt' in val_data:
-                # 直接从GT下采样生成LQ（简单方式）
+                # 如果没有提供LQ，则从GT生成LQ图像（与训练过程一致）
+                # TODO: 现在训练是先缩放再退化，如果训练改了这里也要改
+                if not hasattr(self, 'jpeger'):
+                    self.jpeger = DiffJPEG(differentiable=False).cuda()
+                if not hasattr(self, 'usm_sharpener'):
+                    self.usm_sharpener = USMSharp().cuda()
+
                 self.gt = val_data['gt'].to(self.device)
-                self.lq = F.interpolate(self.gt, scale_factor=1/self.opt['scale'], mode='bicubic')
+                self.gt_usm = self.usm_sharpener(self.gt)
+
+                self.kernel1 = val_data['kernel1'].to(self.device)
+                self.kernel2 = val_data['kernel2'].to(self.device)
+                self.sinc_kernel = val_data['sinc_kernel'].to(self.device)
+
+                ori_h, ori_w = self.gt.size()[2:4]
+
+                # ----------------------- 第一阶段退化过程 ----------------------- #
+                # 模糊
+                out = filter2D(self.gt_usm, self.kernel1)
+                
+                # 添加噪声
+                gray_noise_prob = self.opt['gray_noise_prob'] if 'gray_noise_prob' in self.opt else 0.4
+                gaussian_noise_prob = self.opt['gaussian_noise_prob'] if 'gaussian_noise_prob' in self.opt else 0.5
+                noise_range = self.opt['noise_range'] if 'noise_range' in self.opt else [1, 15]
+                poisson_scale_range = self.opt['poisson_scale_range'] if 'poisson_scale_range' in self.opt else [0.05, 1.5]
+                
+                if np.random.uniform() < gaussian_noise_prob:
+                    out = random_add_gaussian_noise_pt(
+                        out, sigma_range=noise_range, clip=True, 
+                        rounds=False, gray_prob=gray_noise_prob)
+                else:
+                    out = random_add_poisson_noise_pt(
+                        out, scale_range=poisson_scale_range, 
+                        gray_prob=gray_noise_prob, clip=True, rounds=False)
+                
+                # JPEG压缩
+                jpeg_range = self.opt['jpeg_range'] if 'jpeg_range' in self.opt else [40, 95]
+                jpeg_p = out.new_zeros(out.size(0)).uniform_(*jpeg_range)
+                out = torch.clamp(out, 0, 1)  # 裁剪到[0, 1]，否则JPEGer会产生不良伪影
+                out = self.jpeger(out, quality=jpeg_p)
+
+                # ----------------------- 第二阶段退化过程 ----------------------- #
+                # 模糊
+                second_blur_prob = self.opt['second_blur_prob'] if 'second_blur_prob' in self.opt else 0.8
+                if np.random.uniform() < second_blur_prob:
+                    out = filter2D(out, self.kernel2)
+                    
+                # 添加噪声
+                gray_noise_prob2 = self.opt['gray_noise_prob2'] if 'gray_noise_prob2' in self.opt else 0.4
+                gaussian_noise_prob2 = self.opt['gaussian_noise_prob2'] if 'gaussian_noise_prob2' in self.opt else 0.5
+                noise_range2 = self.opt['noise_range2'] if 'noise_range2' in self.opt else [1, 12]
+                poisson_scale_range2 = self.opt['poisson_scale_range2'] if 'poisson_scale_range2' in self.opt else [0.05, 1.25]
+                
+                if np.random.uniform() < gaussian_noise_prob2:
+                    out = random_add_gaussian_noise_pt(
+                        out, sigma_range=noise_range2, clip=True, 
+                        rounds=False, gray_prob=gray_noise_prob2)
+                else:
+                    out = random_add_poisson_noise_pt(
+                        out, scale_range=poisson_scale_range2, 
+                        gray_prob=gray_noise_prob2, clip=True, rounds=False)
+      
+                # JPEG压缩
+                jpeg_range2 = self.opt['jpeg_range2'] if 'jpeg_range2' in self.opt else [40, 95]
+                jpeg_p = out.new_zeros(out.size(0)).uniform_(*jpeg_range2)
+                out = torch.clamp(out, 0, 1)
+                out = self.jpeger(out, quality=jpeg_p)
+                
+                # 最终的sinc滤波
+                out = filter2D(out, self.sinc_kernel)
+                
+                # 在完成所有退化后再进行缩放
+                scale = self.opt['scale'] if 'scale' in self.opt else 4
+                mode = random.choice(['area', 'bilinear', 'bicubic'])
+                out = F.interpolate(out, size=(ori_h // scale, ori_w // scale), mode=mode)
+                
+                # clamp and round
+                self.lq = torch.clamp((out * 255.0).round(), 0, 255) / 255.
+
+                # 确保GT和lq尺寸匹配
+                target_h, target_w = self.lq.size()[2:4]  # lq尺寸
+                gt_h, gt_w = target_h * scale, target_w * scale  # 期望的gt尺寸
+                
+                # 如果GT尺寸不匹配，则调整GT和gt_usm的尺寸
+                if self.gt.size(2) != gt_h or self.gt.size(3) != gt_w:
+                    self.gt = F.interpolate(self.gt, size=(gt_h, gt_w), mode='bicubic')
+                    self.gt_usm = F.interpolate(self.gt_usm, size=(gt_h, gt_w), mode='bicubic')
+            else:
+                raise ValueError("没有提供低质量图像或高分辨率图像")
+                
+            if 'control_map' in val_data:
+                self.control_map = val_data['control_map'].to(self.device)
+            else:
+                logger = get_root_logger()
+                logger.warning("没有提供控制映射，尝试从其他数据创建")
+                raise ValueError("没有提供控制映射")
 
             # 获取图像名称
-            img_name = osp.splitext(osp.basename(val_data['gt_path'][0]))[0]
+            if 'gt_path' in val_data:
+                img_name = osp.splitext(osp.basename(val_data['gt_path'][0]))[0]
+            elif 'lq_path' in val_data:
+                img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
+            else:
+                img_name = f"val_img_{idx}"
             
             # 进行两种测试：有文本引导和无文本引导
             results = {}
@@ -688,24 +1318,22 @@ class TGSRModel(SRGANModel):
             
             # 计算指标和保存图像
             visuals = self.get_current_visuals()
-            sr_img_original = tensor2img([visuals['result']])  # 原始超分辨率结果
+            sr_img_original = tensor2img([visuals['result']])
             
             # 只保存前20张图片的结果
             save_this_img = save_img and idx < 20
                 
             # 保存注意力图（如果有）
-            if save_this_img and self.attention_maps:
+            if save_this_img and self.attention_maps and self.opt.get('val').get('save_attention_maps'):
                 attention_maps = self.get_current_attention_maps()
                 if attention_maps:
                     # 创建sr_img的独立副本用于热力图处理
                     sr_img_heatmap = sr_img_original.copy()
                     
-                    # 1. 使用GradCAM风格保存合并后的注意力图
-                    if self.opt.get('val', {}).get('save_attention_maps', False):
-                        attn_save_path = self.save_gradcam_attention(sr_img_heatmap, attention_maps, img_name, save_path_root, current_iter)
+                    # 使用GradCAM风格保存合并后的注意力图
+                    attn_save_path = self.save_gradcam_attention(sr_img_heatmap, attention_maps, img_name, save_path_root, current_iter)
                     
-                    # 2. 新增：直接在输出图像上叠加注意力图
-                    # 合并所有注意力图
+                    # 直接在输出图像上叠加注意力图
                     all_maps = np.stack([attn for attn in attention_maps.values()])
                     combined_map = np.mean(all_maps, axis=0)
                     
@@ -726,9 +1354,56 @@ class TGSRModel(SRGANModel):
                     # 保存叠加图
                     overlay_save_path = osp.join(save_path_root, f'{img_name}_overlay_{current_iter}.png')
                     imwrite(overlay_img, overlay_save_path)
+                    
+            # 保存控制映射可视化（如果有）
+            if save_this_img and hasattr(self, 'control_map') and self.opt.get('val', {}).get('save_control_maps'):
+                # 获取控制映射
+                control_map = self.control_map[0].detach().cpu().numpy()
+                
+                # 转换为可视化格式 [C, H, W] -> [H, W, C]
+                control_map = np.transpose(control_map, (1, 2, 0))
+                
+                # 将每个通道分别可视化
+                control_channels = []
+                titles = ["Canny Edge", "Depth Map", "Object Mask"]
+                
+                for i in range(control_map.shape[2]):
+                    channel = control_map[:, :, i]
+                    
+                    # 归一化到0-255
+                    if np.max(channel) > np.min(channel):
+                        normalized = (channel - np.min(channel)) / (np.max(channel) - np.min(channel)) * 255
+                    else:
+                        normalized = np.zeros_like(channel)
+                    
+                    # 转换为彩色可视化
+                    if i == 0:  # Canny边缘
+                        colored = cv2.cvtColor(normalized.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+                    elif i == 1:  # 深度图 - 使用热力图
+                        colored = cv2.applyColorMap(normalized.astype(np.uint8), cv2.COLORMAP_INFERNO)
+                    else:
+                        colored = np.zeros((normalized.shape[0], normalized.shape[1], 3), dtype=np.uint8)
+                        colored[normalized > 128, 1] = 255
+
+                    title_height = 30
+                    titled_img = np.ones((colored.shape[0] + title_height, colored.shape[1], 3), dtype=np.uint8) * 255
+                    titled_img[title_height:, :, :] = colored
+                    
+                    cv2.putText(
+                        titled_img, 
+                        titles[i], 
+                        (10, 20), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 
+                        0.5, 
+                        (0, 0, 0), 
+                        1, 
+                        cv2.LINE_AA
+                    )
+                    
+                    control_channels.append(titled_img)
             
             # 2. 可选: 测试无文本引导的结果进行对比
-            if self.opt.get('val', {}).get('compare_with_unguided', False):
+            if self.opt.get('val', {}).get('compare_with_unguided'):
                 if hasattr(self, 'net_g_ema'):
                     with torch.no_grad():
                         self.output = self.forward_sr_network(self.lq, apply_guidance=False)
@@ -738,13 +1413,11 @@ class TGSRModel(SRGANModel):
                         self.output = self.forward_sr_network(self.lq, apply_guidance=False)
                         results['unguided'] = self.output.clone()
             
-            # 设置回引导结果用于指标计算
             self.output = results['guided']
             
             # 保存文本提示和比较图
             if save_this_img:
                 
-                # 保存文本提示信息
                 if 'text_prompt' in val_data:
                     prompt_path = osp.join(save_path_root, f'{img_name}_prompt_{current_iter}.txt')
                     with open(prompt_path, 'w') as f:
@@ -755,16 +1428,15 @@ class TGSRModel(SRGANModel):
                     unguided_output = results['unguided']
                     unguided_img = tensor2img([unguided_output.detach().cpu()])
                     # 创建对比图
-                    if self.opt.get('val', {}).get('save_comparison', False):
+                    if self.opt.get('val', {}).get('save_comparison'):
                         # 创建四列对比图（LQ、无引导、有引导、GT+掩码）
-                        # 使用原始的SR结果，而不是可能被修改的sr_img
-                        guided_img = sr_img_original.copy()  # 确保创建新的副本
+                        guided_img = sr_img_original.copy()
                         lq_img = tensor2img([self.lq])
                         gt_img = tensor2img([visuals['gt']])
                         
                         # 准备注意力图和掩码图像
                         overlay_ratio = 0.0  # 默认重叠率
-                        gt_with_mask = gt_img.copy()  # 初始化为原始GT图像
+                        gt_with_mask = gt_img.copy()
                         
                         # 获取注意力图
                         attention_map = None
@@ -793,9 +1465,7 @@ class TGSRModel(SRGANModel):
                                                 from tgsr.losses.tgsr_loss import decode_mask
                                                 obj_mask = decode_mask(obj['mask_encoded'])
                                                 if obj_mask is not None and obj_mask.sum() > 0:
-                                                    # 调整掩码大小
                                                     obj_mask_resized = cv2.resize(obj_mask, (w, h), interpolation=cv2.INTER_LINEAR)
-                                                    # 合并掩码
                                                     mask = np.maximum(mask, obj_mask_resized)
                                             except Exception as e:
                                                 print(f"掩码处理错误: {e}")
@@ -817,8 +1487,7 @@ class TGSRModel(SRGANModel):
                                         
                                         # 计算掩码和注意力图的重叠率
                                         if attention_map is not None:
-                                            # 正确计算重叠率
-                                            # 1. 注意力图中高于均值的点被认为是"注意"区域
+                                            # 1. 注意力图中高于均值的点被认为是注意区域
                                             attention_thresh = np.mean(attention_map) + 0.5 * np.std(attention_map)
                                             attention_binary = (attention_map > attention_thresh).astype(np.float32)
                                             
@@ -831,19 +1500,6 @@ class TGSRModel(SRGANModel):
                                             if mask_area > 0:
                                                 overlay_ratio = intersection / mask_area
                                                 
-                                                # 可视化注意力图和掩码重叠区域（仅调试使用）
-                                                if self.opt.get('val', {}).get('save_debug_overlap', False):
-                                                    overlap_debug = np.zeros((h, w, 3), dtype=np.uint8)
-                                                    # 蓝色表示掩码
-                                                    overlap_debug[mask_binary > 0] = [255, 0, 0]
-                                                    # 绿色表示注意力高区域
-                                                    overlap_debug[attention_binary > 0] = [0, 255, 0]
-                                                    # 红色表示重叠区域
-                                                    overlap_debug[(mask_binary > 0) & (attention_binary > 0)] = [0, 0, 255]
-                                                    
-                                                    # 保存可视化图像
-                                                    debug_path = osp.join(save_path_root, f'{img_name}_overlap_debug_{current_iter}.png')
-                                                    imwrite(overlap_debug, debug_path)
                             except Exception as e:
                                 print(f"对象信息处理错误: {e}")
                         
@@ -854,17 +1510,18 @@ class TGSRModel(SRGANModel):
                         
                         # 创建四列对比图（LQ、无引导、有引导、GT+掩码）
                         comparison = np.zeros((h, w*4, 3), dtype=np.uint8)
-                        comparison[:, :w] = lq_img        # 第一列显示LQ
-                        comparison[:, w:2*w] = unguided_img  # 第二列显示无引导结果
-                        comparison[:, 2*w:3*w] = guided_img    # 第三列显示引导结果
-                        comparison[:, 3*w:] = gt_with_mask      # 第四列显示GT+掩码
+                        comparison[:, :w] = lq_img
+                        comparison[:, w:2*w] = unguided_img
+                        comparison[:, 2*w:3*w] = guided_img
+                        comparison[:, 3*w:] = gt_with_mask
                         
                         # 添加分割线
-                        comparison[:, w-1:w+1] = [0, 0, 255]  # 红色分割线
-                        comparison[:, 2*w-1:2*w+1] = [0, 0, 255]  # 红色分割线
-                        comparison[:, 3*w-1:3*w+1] = [0, 0, 255]  # 红色分割线
+                        comparison[:, w-1:w+1] = [0, 0, 255]
+                        comparison[:, 2*w-1:2*w+1] = [0, 0, 255]
+                        comparison[:, 3*w-1:3*w+1] = [0, 0, 255]
                         
                         # 将重叠率添加到文件名中
+                        # TODO: 感觉重叠率逻辑有点问题，没考虑注意力发散的问题
                         overlap_text = f"_overlap{overlay_ratio:.2f}"
                         save_comp_path = osp.join(save_path_root, f'{img_name}_comparison{overlap_text}_{current_iter}.png')
                         imwrite(comparison, save_comp_path)
@@ -877,7 +1534,7 @@ class TGSRModel(SRGANModel):
                     self.metric_results[name] += calculate_metric(metric_data, opt_)
                 
                 # 对比引导与非引导结果（如果有）
-                if 'unguided' in results and self.opt.get('val', {}).get('compare_metrics', False):
+                if 'unguided' in results and self.opt.get('val', {}).get('compare_metrics'):
                     unguided_img = tensor2img([results['unguided'].detach().cpu()])
                     unguided_metric_data = {'img': unguided_img, 'img2': gt_img}
                     for name, opt_ in self.opt['val']['metrics'].items():
@@ -958,244 +1615,6 @@ class TGSRModel(SRGANModel):
         """模型前向传播"""
         self.output = self.forward_sr_network(self.lq, apply_guidance)
 
-    def optimize_parameters(self, current_iter):
-        """优化参数，整合SR网络和文本引导网络"""
-        # 保存当前迭代次数
-        self.iter = current_iter
-        
-        # 检查是否处于阶段转换点
-        if self.opt['train'].get('stage_train', False):
-            for stage_idx, stage in enumerate(self.opt['train']['stages']):
-                if current_iter == stage['iters'] and stage_idx > 0:  # 确保不是第一个阶段
-                    self.logger.info(f'进入阶段 {stage["name"]} 在迭代 {current_iter}')
-                    
-                    # 根据不同阶段使用不同的转换策略
-                    if stage_idx == 1:  # 从预训练到联合轻度训练
-                        # 1. 调整判别器参数，但保持某些层不变
-                        for name, m in self.net_d.named_modules():
-                            if isinstance(m, nn.Conv2d) and 'final' not in name:
-                                # 使用较小初始化权重，避免梯度爆炸
-                                nn.init.normal_(m.weight, 0, 0.02)
-                        
-                        # 2. 调整生成器学习率
-                        for param_group in self.optimizer_g.param_groups:
-                            param_group['lr'] = stage['lr_g']
-                            param_group['initial_lr'] = stage['lr_g']
-                        
-                        # 3. 重建判别器优化器，但权重缩小
-                        if hasattr(self, 'optimizer_d'):
-                            optim_d_config = self.opt['train']['optim_d'].copy()
-                            optim_type = optim_d_config.pop('type')
-                            optim_d_config['lr'] = stage['lr_d']
-                            self.optimizer_d = self.get_optimizer(optim_type, self.net_d.parameters(), **optim_d_config)
-                            
-                            # 确保每个参数组都有initial_lr参数
-                            for param_group in self.optimizer_d.param_groups:
-                                param_group['initial_lr'] = param_group['lr']
-                            
-                            # 更新优化器列表
-                            if len(self.optimizers) > 1:
-                                self.optimizers[1] = self.optimizer_d
-                    
-                    elif stage_idx == 2:  # 从轻度联合到完全联合
-                        # 更新所有优化器的学习率
-                        for param_group in self.optimizer_g.param_groups:
-                            param_group['lr'] = stage['lr_g']
-                            param_group['initial_lr'] = stage['lr_g']
-                            
-                        for param_group in self.optimizer_d.param_groups:
-                            param_group['lr'] = stage['lr_d']
-                            param_group['initial_lr'] = stage['lr_d']
-                            
-                        if hasattr(self, 'optimizer_t'):
-                            for param_group in self.optimizer_t.param_groups:
-                                param_group['lr'] = stage['lr_t']
-                                param_group['initial_lr'] = stage['lr_t']
-        
-        # 定期清理CUDA缓存以减少内存碎片
-        if current_iter % 50 == 0:
-            torch.cuda.empty_cache()
-            
-        # 设置GT图像（带锐化或不带）
-        l1_gt = self.gt_usm if self.opt.get('l1_gt_usm', True) else self.gt
-        percep_gt = self.gt_usm if self.opt.get('percep_gt_usm', True) else self.gt
-        gan_gt = self.gt_usm if self.opt.get('gan_gt_usm', False) else self.gt
-        
-        # 优化生成器（SR网络）
-        for p in self.net_d.parameters():
-            p.requires_grad = False
-
-        # 清零梯度
-        self.optimizer_g.zero_grad()
-        if self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t'):
-            self.optimizer_t.zero_grad()
-        
-        # 前向传播，应用文本引导
-        self.output = self.forward_sr_network(self.lq, apply_guidance=True)
-
-        l_g_total = 0
-        loss_dict = OrderedDict()
-        
-        # 像素损失
-        if self.cri_pix:
-            l_g_pix = self.cri_pix(self.output, l1_gt)
-            l_g_total += l_g_pix
-            loss_dict['l_g_pix'] = l_g_pix
-        # 感知损失
-        if self.cri_perceptual:
-            l_g_percep, l_g_style = self.cri_perceptual(self.output, percep_gt)
-            if l_g_percep is not None:
-                l_g_total += l_g_percep
-                loss_dict['l_g_percep'] = l_g_percep
-            if l_g_style is not None:
-                l_g_total += l_g_style
-                loss_dict['l_g_style'] = l_g_style
-        # GAN损失
-        fake_g_pred = self.net_d(self.output)
-        l_g_gan = self.cri_gan(fake_g_pred, True, is_disc=False)
-        l_g_total += l_g_gan
-        loss_dict['l_g_gan'] = l_g_gan
-
-        # 文本控制网络损失
-        if hasattr(self, 'cri_control') and self.use_text_features and hasattr(self, 'attention_maps'):
-            # 获取文本特征
-            text_hidden, text_pooled = self.encode_text(self.text_prompts)
-            
-            # 获取控制特征和注意力图 - 在前向传播中已生成
-            attention_maps = self.attention_maps
-            
-            # 获取控制特征 - 这里简化为使用第一个特征，在实际应用中可能需要更复杂的逻辑
-            if hasattr(self, 'net_g') and hasattr(self.net_g, 'conv_first'):
-                with torch.no_grad():
-                    control_features = self.net_g.conv_first(self.lq)
-            
-            # 计算控制特征损失
-            objects_info = self.objects_info if hasattr(self, 'objects_info') else None
-            l_control = self.cri_control(control_features, attention_maps, text_pooled, objects_info, self.device)
-            l_g_total += l_control
-            loss_dict['l_control'] = l_control
-
-        # 如果有文本引导网络，保留计算图以便后续的反向传播
-        retain_graph = self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t')
-        l_g_total.backward(retain_graph=retain_graph)
-        
-        # 文本引导网络损失 - 原有的语义一致性损失等
-        l_t_total = 0
-        if self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t'):
-            # 获取文本特征和对象信息
-            text_hidden, text_pooled = self.encode_text(self.text_prompts)
-            objects_info = None
-            if hasattr(self, 'objects_info'):
-                objects_info = self.objects_info
-            
-            # ControlNet架构不再使用以下缓存
-            # 1. 注意力损失
-            if hasattr(self, 'cri_attention') and hasattr(self, 'attention_maps') and objects_info is not None:
-                # 计算注意力损失
-                attn_logits = self.attention_maps[-1]
-                
-                # 从对象信息中创建掩码
-                batch_size = attn_logits.shape[0]
-                h, w = attn_logits.shape[-2:]
-                text_masks = torch.zeros((batch_size, 1, h, w), device=self.device)
-                
-                # 为每个样本创建掩码
-                for i in range(batch_size):
-                    if i >= len(objects_info) or not objects_info[i]:
-                        continue
-                        
-                    objects = objects_info[i]
-                    # 合并对象掩码为单个文本掩码
-                    for obj in objects:
-                        if 'mask_encoded' in obj:
-                            try:
-                                # 解码掩码并调整大小
-                                from tgsr.losses.tgsr_loss import decode_mask
-                                obj_mask = decode_mask(obj['mask_encoded'])
-                                if obj_mask is not None and obj_mask.sum() > 0:
-                                    # 调整掩码大小并合并
-                                    obj_mask_tensor = torch.from_numpy(obj_mask).float().to(self.device)
-                                    obj_mask_tensor = F.interpolate(
-                                        obj_mask_tensor.unsqueeze(0).unsqueeze(0), 
-                                        size=(h, w), 
-                                        mode='bilinear', 
-                                        align_corners=False
-                                    )
-                                    text_masks[i] = torch.max(text_masks[i], obj_mask_tensor[0])
-                            except Exception:
-                                continue
-                
-                # 使用正确的参数调用attention损失函数
-                l_t_attn = self.cri_attention(attn_logits, text_masks)
-                l_t_total += l_t_attn
-                loss_dict['l_t_attn'] = l_t_attn
-            
-            # 特征平滑性损失 - 防止特征过于剧烈变化
-            if hasattr(self, 'attention_maps') and len(self.attention_maps) > 0:
-                # 计算空间平滑性
-                attention = torch.sigmoid(self.attention_maps[-1])
-                
-                # 水平和垂直梯度
-                h_grad = torch.abs(attention[:, :, :, :-1] - attention[:, :, :, 1:]).mean()
-                v_grad = torch.abs(attention[:, :, :-1, :] - attention[:, :, 1:, :]).mean()
-                
-                # 总梯度惩罚
-                smoothness = (h_grad + v_grad) * 0.5
-                smoothness_weight = 0.1  # 可调
-                
-                l_t_smooth = smoothness * smoothness_weight
-                l_t_total += l_t_smooth
-                loss_dict['l_t_smooth'] = l_t_smooth
-            
-            # 记录文本引导损失总和并反向传播
-            if l_t_total > 0:
-                loss_dict['l_t_total'] = l_t_total
-                l_t_total.backward()
-                
-                # 添加梯度裁剪，放在optimizer_t.step()前
-                torch.nn.utils.clip_grad_norm_(self.net_t.parameters(), max_norm=1.0)
-        
-        # 执行优化器步骤
-        self.optimizer_g.step()
-        if self.use_text_features and hasattr(self, 'net_t') and hasattr(self, 'optimizer_t'):
-            self.optimizer_t.step()
-        
-        # 清理GPU内存
-        if hasattr(torch.cuda, 'empty_cache'):
-            torch.cuda.empty_cache()
-        
-        # 优化判别器
-        for p in self.net_d.parameters():
-            p.requires_grad = True
-
-        self.optimizer_d.zero_grad()
-        # 真实样本
-        real_d_pred = self.net_d(gan_gt)
-        l_d_real = self.cri_gan(real_d_pred, True, is_disc=True)
-        loss_dict['l_d_real'] = l_d_real
-        loss_dict['out_d_real'] = torch.mean(real_d_pred.detach())
-        l_d_real.backward()
-        
-        # 清理GPU内存
-        if hasattr(torch.cuda, 'empty_cache'):
-            torch.cuda.empty_cache()
-            
-        # 虚假样本
-        fake_d_pred = self.net_d(self.output.detach())
-        l_d_fake = self.cri_gan(fake_d_pred, False, is_disc=True)
-        loss_dict['l_d_fake'] = l_d_fake
-        loss_dict['out_d_fake'] = torch.mean(fake_d_pred.detach())
-        l_d_fake.backward()
-        self.optimizer_d.step()
-        # 判别器更新后也立即清零梯度
-        self.optimizer_d.zero_grad()
-
-        self.log_dict = loss_dict
-        
-        # 更新EMA模型
-        if self.ema_decay > 0:
-            self.model_ema(decay=self.ema_decay)
-    
     def get_current_attention_maps(self):
         """获取当前注意力图，用于可视化"""
         if self.attention_maps is None or len(self.attention_maps) == 0:
@@ -1233,19 +1652,12 @@ class TGSRModel(SRGANModel):
         return attention_dict
     
     def save(self, epoch, current_iter):
-        """保存模型"""
-        if hasattr(self, 'net_g_ema'):
-            self.save_network([self.net_g, self.net_g_ema], 'net_g', current_iter, param_key=['params', 'params_ema'])
-        else:
-            self.save_network(self.net_g, 'net_g', current_iter)
-        self.save_network(self.net_d, 'net_d', current_iter)
-        self.save_network(self.net_t, 'net_t', current_iter)
-        
-        # 保存微调后的CLIP文本编码器(如果已解冻)
-        if hasattr(self, 'clip_text_encoder') and not self.freeze_text_encoder:
-            self.save_network(self.clip_text_encoder, 'clip_text_encoder', current_iter)
-        
-        # 保存训练状态
+        """保存模型 - 只保存ControlNet（MultiControlNet）网络"""
+        # TODO: 只保存ControlNet（包括Canny、Depth、Mask），不保存SR网络，因为冻结了RRDBNet和Clip，然后如果需要支持恢复训练，需要保存DiscriminatorNet，存储空间不够了
+        if hasattr(self, 'net_control'):
+            self.save_network(self.net_control, 'net_control', current_iter)
+
+        # TODO: 感觉暂时可以不用保存  
         self.save_training_state(epoch, current_iter)
     
     def save_gradcam_attention(self, img, attention_maps, img_name, save_path, iter_num):

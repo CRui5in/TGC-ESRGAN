@@ -1,3 +1,4 @@
+import traceback
 import cv2
 import math
 import numpy as np
@@ -15,31 +16,31 @@ from basicsr.utils.registry import DATASET_REGISTRY
 from torch.utils import data as data
 from torch.utils.data.dataloader import default_collate
 from pycocotools import mask as mask_util
+from transformers import DPTImageProcessor, DPTForDepthEstimation
+from torch.utils.data._utils.collate import default_collate
+from PIL import Image
+import io
+import multiprocessing
+
+multiprocessing.set_start_method('spawn', force=True)
 
 
 def bytes_to_string_json_safe(obj):
-    """递归地将嵌套数据结构中的bytes对象转换为字符串，使其可以被JSON序列化
-    
-    Args:
-        obj: 要转换的对象，可以是任何Python数据类型
-        
-    Returns:
-        转换后的对象，其中所有bytes已转换为字符串
-    """
+    """递归转换嵌套数据结构中的bytes为字符串，使其可被JSON序列化"""
     if isinstance(obj, bytes):
         return obj.decode('utf-8', errors='replace')
     elif isinstance(obj, list):
         return [bytes_to_string_json_safe(item) for item in obj]
     elif isinstance(obj, dict):
         return {k: bytes_to_string_json_safe(v) for k, v in obj.items()}
-    elif hasattr(obj, '__dict__'):  # 对象类型
+    elif hasattr(obj, '__dict__'):
         return bytes_to_string_json_safe(obj.__dict__)
     else:
         return obj
 
 
 def decode_mask(rle):
-    """将RLE编码的掩码解码为二维数组"""
+    """解码RLE格式的掩码为二维数组"""
     if isinstance(rle['counts'], str):
         rle['counts'] = rle['counts'].encode('utf-8')
     mask = mask_util.decode(rle)
@@ -47,8 +48,7 @@ def decode_mask(rle):
 
 
 def encode_mask(mask):
-    """将二维掩码编码为Run-Length编码格式"""
-    # 使用pycocotools的RLE编码
+    """编码二维掩码为RLE格式"""
     mask = np.asfortranarray(mask.astype(np.uint8))
     rle = mask_util.encode(mask)
     if isinstance(rle['counts'], bytes):
@@ -56,52 +56,27 @@ def encode_mask(mask):
     return rle
 
 
-# 增强掩码与图像同步
 def augment_mask(mask, flip_h=False, rot=False):
-    """对掩码应用与图像相同的增强变换，确保与BasicSR中的augment函数完全一致
-    
-    Args:
-        mask (np.ndarray): 二维掩码数组
-        flip_h (bool): 是否水平翻转
-        rot (bool): 是否旋转90度
-        
-    Returns:
-        np.ndarray: 增强后的掩码
-    """
-    # 确保掩码是二维数组
+    """对掩码应用与图像相同的数据增强变换"""
     assert len(mask.shape) == 2, f"掩码应该是二维数组, 但是形状是 {mask.shape}"
     
-    # 创建副本以避免修改原始数据
     mask = mask.copy()
     
-    # 1. 水平翻转 (如需要) - 与basicsr完全一致
     if flip_h:
         mask = mask[:, ::-1]
     
-    # 2. 旋转 (如需要) - 与basicsr完全一致：先转置后水平翻转
     if rot:
-        mask = mask.transpose(1, 0)  # HW -> WH
-        mask = mask[:, ::-1]  # 水平翻转
+        mask = mask.transpose(1, 0)
+        mask = mask[:, ::-1]
     
     return mask
 
 
 @DATASET_REGISTRY.register()
 class TGSRDataset(data.Dataset):
-    """Dataset用于文本引导的超分辨率模型。
+    """文本引导的超分辨率数据集
     
-    它继承RealESRGAN数据集并支持文本提示。
-    它加载GT图像并增强它们，同时生成用于低质量图像生成的模糊核和sinc核。
-    低质量图像在GPU上以张量形式处理以实现更快的处理。
-
-    Args:
-        opt (dict): 训练数据集的配置。它包含以下键：
-            dataroot_gt (str): gt的数据根路径。
-            text_file (str): 文本提示文件的路径。
-            io_backend (dict): IO后端类型和其他kwarg。
-            use_hflip (bool): 使用水平翻转。
-            use_rot (bool): 使用旋转（使用垂直翻转和转置h和w进行实现）。
-            请参阅代码中的更多选项。
+    加载GT图像和文本描述，生成低质量图像和控制映射
     """
 
     def __init__(self, opt):
@@ -111,13 +86,34 @@ class TGSRDataset(data.Dataset):
         self.io_backend_opt = opt['io_backend']
         self.gt_root, self.text_file = Path(opt['dataroot_gt']), opt['text_file']
         self.logger = get_root_logger()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 读取文本描述和对象信息
+        # 初始化控制映射生成组件
+        self.use_depth_model = opt.get('use_depth_model')
+        self.use_canny = opt.get('use_canny')
+        self.canny_low = opt.get('canny_low')
+        self.canny_high = opt.get('canny_high')
+        
+        # 加载深度估计模型
+        if self.use_depth_model:
+            try:
+                self.logger.info("加载MiDaS深度模型...")
+                depth_model_path = opt.get('depth_model_path')
+                self.depth_processor = DPTImageProcessor.from_pretrained(depth_model_path, local_files_only=True)
+                self.depth_model = DPTForDepthEstimation.from_pretrained(depth_model_path, local_files_only=True)
+                self.depth_model = self.depth_model.to(self.device)
+                self.depth_model.eval()
+                self.logger.info(f"MiDaS模型加载成功: {depth_model_path}")
+            except Exception as e:
+                self.logger.error(f"深度模型加载失败: {e}")
+                self.use_depth_model = False
+        
+        # 加载文本描述和对象信息
         try:
             with open(self.text_file, 'r') as f:
                 self.captions = json.load(f)
             
-            # 检查是否为新格式 (带有对象信息)
+            # 检查是否包含对象信息
             self.has_object_info = False
             if len(self.captions) > 0:
                 first_item = self.captions[0] if isinstance(self.captions, list) else list(self.captions.values())[0]
@@ -125,39 +121,32 @@ class TGSRDataset(data.Dataset):
                     if isinstance(first_item['objects'], list) and len(first_item['objects']) > 0:
                         if isinstance(first_item['objects'][0], dict) and 'mask_encoded' in first_item['objects'][0]:
                             self.has_object_info = True
-                            self.logger.info("检测到包含对象掩码信息的数据集")
+                            self.logger.info("检测到对象掩码信息")
             
-            self.logger.info(f"加载了 {len(self.captions)} 个文本描述和对象信息")
+            self.logger.info(f"加载了{len(self.captions)}个文本描述")
         except Exception as e:
-            self.logger.error(f"加载文本描述和对象信息失败: {e}")
+            self.logger.error(f"文本数据加载失败: {e}")
             self.captions = []
         
-        # 判断是否为旧格式（直接映射）还是新格式（列表格式）
-        if isinstance(self.captions, dict):
-            # 旧格式：字典映射 image_id -> caption
-            self.paths = sorted(list(self.captions.keys()))
-            self.get_caption = lambda idx: self.captions[self.paths[idx]]
-            self.get_objects = lambda idx: []  # 旧格式没有对象信息
-        else:
-            # 新格式：列表格式，每项包含image_id, caption, objects等
-            self.paths = []
-            for item in self.captions:
-                if 'hr_path' in item:
-                    self.paths.append(item['hr_path'])
-                elif 'image_id' in item:
-                    # 基于图像ID构建路径
-                    split = item.get('split', 'train')
-                    self.paths.append(osp.join(self.gt_root, split, 'hr', f"{item['image_id']}.jpg"))
+        # 构建图像路径列表
+        self.paths = []
+        for item in self.captions:
+            if 'hr_path' in item:
+                self.paths.append(item['hr_path'])
+            elif 'image_id' in item:
+                split = item.get('split', 'train')
+                self.paths.append(osp.join(self.gt_root, split, 'hr', f"{item['image_id']}.jpg"))
             
-            self.get_caption = lambda idx: self.captions[idx].get('caption', '')
-            self.get_objects = lambda idx: self.captions[idx].get('objects', [])
+            # 设置caption和objects获取方法
+            self.get_caption = self._get_caption_list
+            self.get_objects = self._get_objects_list
         
-        # 初始化数据增强选项
-        self.use_hflip = opt.get('use_hflip', False)
-        self.use_rot = opt.get('use_rot', False)  # 不推荐使用旋转，会影响文本与图像的一致性
-        self.gt_size = opt.get('gt_size', 256)
+        # 数据增强设置
+        self.use_hflip = opt.get('use_hflip')
+        self.use_rot = opt.get('use_rot')
+        self.gt_size = opt.get('gt_size')
         
-        # file client (io backend)
+        # 设置IO后端
         if 'io_backend' in self.opt and self.io_backend_opt['type'] == 'lmdb':
             self.io_backend_opt['db_paths'] = [self.gt_root]
             self.io_backend_opt['client_keys'] = ['gt']
@@ -166,84 +155,172 @@ class TGSRDataset(data.Dataset):
             with open(osp.join(self.gt_root, 'meta_info.txt')) as fin:
                 self.paths = [line.split('.')[0] for line in fin]
         else:
-            # disk backend with explicit paths
-            # We search for all files in the gt_folder
+            # 如果路径为空，从文件夹获取
             if len(self.paths) == 0:
                 self.paths = self._get_paths_from_folder(self.gt_root)
+                
+        # 初始化退化参数
+        # 第一阶段退化
+        self.blur_kernel_size = opt.get('blur_kernel_size')
+        self.kernel_list = opt.get('kernel_list')
+        self.kernel_prob = opt.get('kernel_prob')
+        self.blur_sigma = opt.get('blur_sigma')
+        self.betag_range = opt.get('betag_range')
+        self.betap_range = opt.get('betap_range')
+        self.sinc_prob = opt.get('sinc_prob')
 
-        # 初始化退化参数 (从opt获取或使用默认值)
-        # blur settings for the first degradation
-        self.blur_kernel_size = opt.get('blur_kernel_size', 21)
-        self.kernel_list = opt.get('kernel_list', ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso'])
-        self.kernel_prob = opt.get('kernel_prob', [0.45, 0.25, 0.12, 0.03, 0.12, 0.03])
-        self.blur_sigma = opt.get('blur_sigma', [0.2, 3.0])
-        self.betag_range = opt.get('betag_range', [0.5, 4.0])
-        self.betap_range = opt.get('betap_range', [1, 2.0])
-        self.sinc_prob = opt.get('sinc_prob', 0.1)
+        # 第二阶段退化
+        self.blur_kernel_size2 = opt.get('blur_kernel_size2')
+        self.kernel_list2 = opt.get('kernel_list2')
+        self.kernel_prob2 = opt.get('kernel_prob2')
+        self.blur_sigma2 = opt.get('blur_sigma2')
+        self.betag_range2 = opt.get('betag_range2')
+        self.betap_range2 = opt.get('betap_range2')
+        self.sinc_prob2 = opt.get('sinc_prob2')
 
-        # blur settings for the second degradation
-        self.blur_kernel_size2 = opt.get('blur_kernel_size2', 21)
-        self.kernel_list2 = opt.get('kernel_list2', ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso'])
-        self.kernel_prob2 = opt.get('kernel_prob2', [0.45, 0.25, 0.12, 0.03, 0.12, 0.03])
-        self.blur_sigma2 = opt.get('blur_sigma2', [0.2, 1.5])
-        self.betag_range2 = opt.get('betag_range2', [0.5, 4.0])
-        self.betap_range2 = opt.get('betap_range2', [1, 2.0])
-        self.sinc_prob2 = opt.get('sinc_prob2', 0.1)
+        # 最终sinc滤波
+        self.final_sinc_prob = opt.get('final_sinc_prob')
 
-        # a final sinc filter
-        self.final_sinc_prob = opt.get('final_sinc_prob', 0.8)
-
-        self.kernel_range = [2 * v + 1 for v in range(3, 11)]  # kernel size ranges from 7 to 21
-        self.pulse_tensor = torch.zeros(21, 21).float()  # convolving with pulse tensor brings no blurry effect
+        # 核大小范围和脉冲张量
+        self.kernel_range = [2 * v + 1 for v in range(3, 11)]  # 7到21的核大小
+        self.pulse_tensor = torch.zeros(21, 21).float()
         self.pulse_tensor[10, 10] = 1
+        
+        # 控制映射权重
+        self.canny_weight = opt.get('canny_weight', 0.4)
+        self.depth_weight = opt.get('depth_weight', 0.3)
+        self.mask_weight = opt.get('mask_weight', 0.3)
 
     def _get_paths_from_folder(self, folder):
-        """Get image paths from folder."""
+        """获取文件夹中的图像路径"""
         img_paths = []
         for root, _, files in os.walk(folder):
             for file in files:
                 if file.endswith(('.png', '.jpg', '.jpeg', '.JPEG', '.tif')):
                     img_paths.append(os.path.join(root, file))
         return sorted(img_paths)
+    
+    def _generate_canny_map(self, img_gt):
+        """生成Canny边缘图"""
+        gray = cv2.cvtColor((img_gt * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, self.canny_low, self.canny_high)
+        return edges.astype(np.float32) / 255.0
+    
+    def _generate_depth_map(self, img_gt):
+        """使用MiDaS生成深度图"""
+        if not self.use_depth_model:
+            h, w = img_gt.shape[:2]
+            return np.zeros((h, w), dtype=np.float32)
+
+        try:
+            # 转换为PIL并进行推理
+            img_pil = Image.fromarray((img_gt * 255).astype(np.uint8))
+            inputs = self.depth_processor(images=img_pil, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                outputs = self.depth_model(**inputs)
+                predicted_depth = outputs.predicted_depth
+
+            # 调整到原始尺寸
+            prediction = torch.nn.functional.interpolate(
+                predicted_depth.unsqueeze(1),
+                size=(img_gt.shape[0], img_gt.shape[1]),
+                mode="bicubic",
+                align_corners=False,
+            )
+
+            # 归一化深度图
+            depth_map = prediction.squeeze().cpu().numpy()
+            depth_min, depth_max = np.min(depth_map), np.max(depth_map)
+            if depth_max > depth_min:
+                depth_map = (depth_map - depth_min) / (depth_max - depth_min)
+            else:
+                depth_map = np.zeros_like(depth_map)
+
+            return depth_map
+
+        except Exception as e:
+            self.logger.warning(f"深度图生成失败: {e}")
+            traceback.print_exc()
+            h, w = img_gt.shape[:2]
+            return np.zeros((h, w), dtype=np.float32)
+    
+    def _generate_mask_map(self, objects_info, h, w):
+        """从对象信息生成掩码图"""
+        mask = np.zeros((h, w), dtype=np.float32)
+        
+        if not objects_info:
+            return mask
+        
+        for obj in objects_info:
+            if 'mask_encoded' in obj:
+                try:
+                    obj_mask = decode_mask(obj['mask_encoded'])
+                    if obj_mask is not None and obj_mask.sum() > 0:
+                        # 调整掩码大小
+                        if obj_mask.shape != (h, w):
+                            obj_mask_resized = cv2.resize(obj_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                        else:
+                            obj_mask_resized = obj_mask
+                        
+                        # 合并掩码
+                        mask = np.maximum(mask, obj_mask_resized.astype(np.float32))
+                except Exception as e:
+                    self.logger.warning(f"掩码处理错误: {e}")
+                    continue
+        
+        return mask
+    
+    def _create_control_map(self, img_gt, objects_info):
+        """创建三通道控制映射：Canny边缘、深度图和对象掩码"""
+        h, w = img_gt.shape[:2]
+        
+        # 生成各通道
+        canny_map = self._generate_canny_map(img_gt) if self.use_canny else np.zeros((h, w), dtype=np.float32)
+        depth_map = self._generate_depth_map(img_gt) if self.use_depth_model else np.zeros((h, w), dtype=np.float32)
+        mask_map = self._generate_mask_map(objects_info, h, w)
+        
+        # 创建三通道控制映射并应用权重
+        control_map = np.stack([
+            canny_map * self.canny_weight,
+            depth_map * self.depth_weight,
+            mask_map * self.mask_weight
+        ], axis=2)
+        
+        return control_map
 
     def __getitem__(self, index):
-        # 初始化文件客户端（如果尚未初始化）
+        # 初始化文件客户端
         if self.file_client is None:
-            # 复制io_backend_opt以避免修改原始字典
             backend_opt = self.io_backend_opt.copy() if 'io_backend' in self.opt else {'type': 'disk'}
             self.file_client = FileClient(backend_opt.pop('type'), **backend_opt)
             
-        # 获取正确的索引
+        # 获取正确的索引和图像路径
         index = index % len(self.paths)
         img_path = self.paths[index]
         
-        # 获取图像路径 - 简化路径处理逻辑
+        # 处理图像路径
         if self.io_backend_opt.get('type') == 'lmdb':
-            # LMDB数据库使用原始路径
             img_gt_path = img_path
         else:
-            # 1. 如果是绝对路径且存在，直接使用
             if osp.isabs(img_path) and osp.exists(img_path):
                 img_gt_path = img_path
             else:
-                # 2. 获取文件名（去除路径部分）
                 img_filename = osp.basename(img_path)
                 
-                # 3. 处理可能的没有扩展名的情况
                 if not img_filename.endswith(('.jpg', '.png', '.jpeg', '.JPEG')):
-                    # 尝试不同的扩展名
                     img_gt_path = osp.join(self.gt_root, f'{img_filename}.jpg')
                     if not osp.exists(img_gt_path):
                         img_gt_path = osp.join(self.gt_root, f'{img_filename}.png')
                 else:
-                    # 直接拼接路径
                     img_gt_path = osp.join(self.gt_root, img_filename)
         
         # 获取文本描述和对象信息
         text_prompt = self.get_caption(index)
         objects_info = self.get_objects(index)
         
-        # 加载图像 - 添加重试逻辑
+        # 加载图像（带重试机制）
         retry = 3
         while retry > 0:
             try:
@@ -252,16 +329,15 @@ class TGSRDataset(data.Dataset):
                 break
             except (IOError, OSError) as e:
                 logger = get_root_logger()
-                logger.warn(f'文件客户端错误: {e}, 剩余重试次数: {retry - 1}')
+                logger.warn(f'文件读取错误: {e}, 剩余重试: {retry - 1}')
                 # 随机选择另一个索引
                 index = random.randint(0, self.__len__() - 1)
                 img_path = self.paths[index]
                 text_prompt = self.get_caption(index)
                 objects_info = self.get_objects(index)
                 
-                # 重新获取图像路径
+                # 更新图像路径
                 if self.io_backend_opt.get('type') != 'lmdb':
-                    # 同样简化路径处理逻辑
                     if osp.isabs(img_path) and osp.exists(img_path):
                         img_gt_path = img_path
                     else:
@@ -273,76 +349,65 @@ class TGSRDataset(data.Dataset):
                         else:
                             img_gt_path = osp.join(self.gt_root, img_filename)
                 
-                time.sleep(1)  # 服务器拥塞时暂停1秒
+                time.sleep(1)  # 暂停1秒
             finally:
                 retry -= 1
         
         if retry == 0:
-            raise Exception(f"加载图像失败，已重试3次: {img_gt_path}")
+            raise Exception(f"图像加载失败: {img_gt_path}")
             
-        # 记录是否使用翻转和旋转
+        # 数据增强
         use_hflip = self.use_hflip and random.random() < 0.5
         use_rot = self.use_rot and random.random() < 0.5
-            
-        # 图像增强处理 - 使用与RealESRGAN相同的方法
         img_gt = augment(img_gt, use_hflip, use_rot)
 
-        # 同步对对象的掩码进行增强
+        # 对掩码应用相同的增强
         if objects_info:
             for obj in objects_info:
                 if 'mask_encoded' in obj:
                     try:
-                        # 解码掩码
                         mask = decode_mask(obj['mask_encoded'])
-                        
-                        # 对掩码应用相同的增强
                         mask = augment_mask(mask, use_hflip, use_rot)
-                        
-                        # 重新编码掩码
                         obj['mask_encoded'] = encode_mask(mask)
                     except Exception as e:
                         logger = get_root_logger() if hasattr(self, 'logger') else None
                         if logger:
-                            logger.warning(f"处理掩码时出错: {e}")
-                        # 如果处理失败，保留原始掩码
+                            logger.warning(f"掩码增强错误: {e}")
 
-        # 调整到固定尺寸 - 确保输出始终是crop_pad_size x crop_pad_size
+        # 调整为固定尺寸
         h, w = img_gt.shape[0:2]
         crop_pad_size = self.gt_size
         
-        # 如果图像尺寸与目标尺寸不同，使用缩放并确保尺寸精确匹配
         if h != crop_pad_size or w != crop_pad_size:
-            # 使用INTER_AREA进行下采样（缩小），使用INTER_LINEAR进行上采样（放大）
+            # 根据情况选择合适的插值方法
             interpolation = cv2.INTER_AREA if h > crop_pad_size or w > crop_pad_size else cv2.INTER_LINEAR
             img_gt = cv2.resize(img_gt, (crop_pad_size, crop_pad_size), interpolation=interpolation)
             
-            # 同样调整所有对象的掩码大小
+            # 同步调整掩码尺寸
             if objects_info:
                 for obj in objects_info:
                     if 'mask_encoded' in obj:
                         try:
-                            # 解码掩码
                             mask = decode_mask(obj['mask_encoded'])
-                            
-                            # 调整掩码大小 - 使用INTER_NEAREST保留二值性质
                             mask_resized = cv2.resize(mask, (crop_pad_size, crop_pad_size), 
-                                                     interpolation=cv2.INTER_NEAREST)
-                            
-                            # 重新编码掩码
+                                                    interpolation=cv2.INTER_NEAREST)
                             obj['mask_encoded'] = encode_mask(mask_resized)
                         except Exception as e:
                             logger = get_root_logger() if hasattr(self, 'logger') else None
                             if logger:
-                                logger.warning(f"调整掩码大小时出错: {e}")
+                                logger.warning(f"掩码调整错误: {e}")
         
-        # 确保大小正确
+        # 确保尺寸正确
         assert img_gt.shape[0] == crop_pad_size and img_gt.shape[1] == crop_pad_size, \
             f"图像尺寸错误: {img_gt.shape}, 应为: {crop_pad_size}x{crop_pad_size}"
+            
+        # 创建控制映射
+        control_map = self._create_control_map(img_gt, objects_info)
 
-        # ------------------------ Generate kernels (used in the first degradation) ------------------------ #
+        # 生成模糊核 (用于第一阶段退化)
         kernel_size = random.choice(self.kernel_range)
         if np.random.uniform() < self.sinc_prob:
-            # this sinc filter setting is for kernels ranging from [7, 21]
+            # sinc滤波器设置
             if kernel_size < 13:
                 omega_c = np.random.uniform(np.pi / 3, np.pi)
             else:
@@ -358,11 +423,11 @@ class TGSRDataset(data.Dataset):
                 self.betag_range,
                 self.betap_range,
                 noise_range=None)
-        # pad kernel
+        # 填充核
         pad_size = (21 - kernel_size) // 2
         kernel = np.pad(kernel, ((pad_size, pad_size), (pad_size, pad_size)))
 
-        # ------------------------ Generate kernels (used in the second degradation) ------------------------ #
+        # 生成第二阶段退化的模糊核
         kernel_size = random.choice(self.kernel_range)
         if np.random.uniform() < self.sinc_prob2:
             if kernel_size < 13:
@@ -381,11 +446,11 @@ class TGSRDataset(data.Dataset):
                 self.betap_range2,
                 noise_range=None)
 
-        # pad kernel
+        # 填充核
         pad_size = (21 - kernel_size) // 2
         kernel2 = np.pad(kernel2, ((pad_size, pad_size), (pad_size, pad_size)))
 
-        # ------------------------------------- the final sinc kernel ------------------------------------- #
+        # 最终的sinc核
         if np.random.uniform() < self.final_sinc_prob:
             kernel_size = random.choice(self.kernel_range)
             omega_c = np.random.uniform(np.pi / 3, np.pi)
@@ -394,12 +459,13 @@ class TGSRDataset(data.Dataset):
         else:
             sinc_kernel = self.pulse_tensor
 
-        # BGR to RGB, HWC to CHW, numpy to tensor
+        # 转换为tensor
         img_gt = img2tensor([img_gt], bgr2rgb=True, float32=True)[0]
         kernel = torch.FloatTensor(kernel)
         kernel2 = torch.FloatTensor(kernel2)
+        control_map = img2tensor([control_map], bgr2rgb=False, float32=True)[0]
         
-        # 返回必要的训练数据
+        # 返回数据
         return_d = {
             'gt': img_gt, 
             'kernel1': kernel, 
@@ -407,10 +473,23 @@ class TGSRDataset(data.Dataset):
             'sinc_kernel': sinc_kernel, 
             'gt_path': img_gt_path,
             'text_prompt': text_prompt,
-            'objects_info_str': json.dumps(bytes_to_string_json_safe(objects_info))  # 先处理bytes再序列化
+            'control_map': control_map,
+            'objects_info_str': json.dumps(bytes_to_string_json_safe(objects_info))
         }
         
         return return_d
 
     def __len__(self):
         return len(self.paths)
+
+    def _get_caption_dict(self, idx):
+        """从字典格式获取图像描述"""
+        return self.captions[self.paths[idx]]
+    
+    def _get_caption_list(self, idx):
+        """从列表格式获取图像描述"""
+        return self.captions[idx].get('caption', '')
+    
+    def _get_objects_list(self, idx):
+        """获取对象信息列表"""
+        return self.captions[idx].get('objects', [])
