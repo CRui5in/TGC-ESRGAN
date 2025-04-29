@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from basicsr.utils.registry import LOSS_REGISTRY
+from basicsr.utils import get_root_logger
 from pycocotools import mask as mask_util
 import numpy as np
 import os
@@ -39,9 +40,10 @@ class CLIPSemanticLoss(nn.Module):
     计算生成图像与文本描述之间的语义相似度
     Lclip = 1 - cos(CLIP_img(G(I_LR)), CLIP_text(T))
     """
-    def __init__(self, loss_weight=1.0, clip_model="openai/clip-vit-large-patch14"):
+    def __init__(self, loss_weight=1.0, clip_model="/root/autodl-tmp/clip-vit-large-patch14"):
         super(CLIPSemanticLoss, self).__init__()
         self.loss_weight = loss_weight
+        self.logger = get_root_logger()
         
         try:
             self.processor = CLIPProcessor.from_pretrained(clip_model)
@@ -56,9 +58,9 @@ class CLIPSemanticLoss(nn.Module):
                 self.model = self.model.cuda()
                 
             self.clip_available = True
-            print(f"成功加载CLIP模型: {clip_model}")
+            self.logger.info(f"成功加载CLIP模型: {clip_model}")
         except Exception as e:
-            print(f"加载CLIP模型失败: {e}")
+            self.logger.error(f"加载CLIP模型失败: {e}")
             self.clip_available = False
     
     def forward(self, sr_images, text_prompts):
@@ -127,7 +129,7 @@ class CLIPSemanticLoss(nn.Module):
             return self.loss_weight * loss
             
         except Exception as e:
-            print(f"CLIP语义损失计算失败: {e}")
+            self.logger.error(f"CLIP语义损失计算失败: {e}")
             return torch.tensor(0.0, device=sr_images.device, requires_grad=True) 
 
 # TODO: 暂时没用到，先测试不添加的模型效果，好像有用，但是如果用这个训练太久会导致注意力莫名其妙发散，5000步感觉就够了        
@@ -135,77 +137,127 @@ class CLIPSemanticLoss(nn.Module):
 class TextRegionAttentionLoss(nn.Module):
     """文本区域注意力监督损失
     
-    引导模型关注文本描述中提到的图像区域
+    引导模型关注文本描述中提到的图像区域，优化注意力分布以集中于目标掩码区域
     """
-    def __init__(self, loss_weight=1.0, reduction='mean', entropy_weight=0.05):
+    def __init__(self, loss_weight=1.0, reduction='mean'):
         super(TextRegionAttentionLoss, self).__init__()
         self.loss_weight = loss_weight
         self.reduction = reduction
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
-        self.entropy_weight = entropy_weight
+        self.logger = get_root_logger()
         
-    def forward(self, attention_logits, text_masks):
-        """计算注意力监督损失
-        
-        同时考虑BCE损失、Focal损失、对比损失和边界损失
-        """
-        if attention_logits is None or text_masks is None:
-            return None
-            
+    def compute_single_loss(self, attention_logits, text_masks):
+        """计算单张注意力图的损失"""
         # 确保尺寸匹配
         if attention_logits.shape[-2:] != text_masks.shape[-2:]:
             text_masks = F.interpolate(text_masks, size=attention_logits.shape[-2:], 
-                                      mode='bilinear', align_corners=False)
+                                      mode='nearest')
         
-        # 空掩码处理
-        if text_masks.sum() == 0:
-            return torch.tensor(0.1, device=attention_logits.device, requires_grad=True)
+        # 应用 sigmoid
+        attn_probs = torch.sigmoid(attention_logits)
         
-        # BCE损失
+        # BCE Loss
         bce_loss = self.bce_loss(attention_logits, text_masks)
-        
-        # 应用reduction
         if self.reduction == 'mean':
             bce_loss = bce_loss.mean()
         elif self.reduction == 'sum':
             bce_loss = bce_loss.sum()
         
-        # 应用sigmoid并保持数值稳定性
-        eps = 1e-7
-        attn_probs = torch.sigmoid(attention_logits)
-        attn_probs = torch.clamp(attn_probs, min=eps, max=1.0-eps)
-        
-        # 熵计算
-        entropy = -attn_probs * torch.log(attn_probs) - (1-attn_probs) * torch.log(1-attn_probs)
-        
-        # Focal Loss (关注困难样本)
-        # TODO: 感觉有用，但是感知不大，可以做消融
-        gamma = 3.0
-        pt = torch.where(text_masks > 0.5, attn_probs, 1-attn_probs)
-        focal_weight = (1 - pt) ** gamma
-        focal_bce_loss = (focal_weight * bce_loss).mean()
-        
-        # 精确率-召回率平衡
-        mask_attn = (attn_probs * text_masks).sum() / (text_masks.sum() + eps)
-        non_mask_attn = (attn_probs * (1-text_masks)).sum() / ((1-text_masks).sum() + eps)
-        
-        # 对比损失 - 确保掩码区域注意力高于非掩码区域
-        contrast_loss = torch.clamp(non_mask_attn - mask_attn + 0.5, min=0.0)
-        
-        # 边界区域注意力损失
-        kernel_size = 3
-        padding = kernel_size // 2
-        pool_masks = F.max_pool2d(text_masks, kernel_size=kernel_size, 
-                                stride=1, padding=padding)
-        boundary_masks = pool_masks - text_masks
-        
-        boundary_weight = 1.5 
-        boundary_loss = F.mse_loss(attn_probs * boundary_masks, boundary_masks) * boundary_weight
+        # Dice Loss
+        intersection = (attn_probs * text_masks).sum()
+        dice_loss = 1 - (2 * intersection) / (attn_probs.sum() + text_masks.sum() + 1e-7)
         
         # 组合损失
-        final_loss = focal_bce_loss + 1.5 * contrast_loss + boundary_loss
+        return bce_loss + dice_loss
+
+    def forward(self, attention_logits, text_masks):
+        """计算注意力监督损失
         
-        # 限制损失最大值
-        final_loss = torch.clamp(final_loss, max=10.0)
+        支持多张注意力图的损失计算
         
-        return self.loss_weight * final_loss
+        Args:
+            attention_logits: 注意力图 logits，列表或单个张量
+            text_masks: 文本区域掩码，形状为 (batch_size, 1, height, width)
+        """
+        # 初始化设备
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # 1. 首先检查 attention_logits 是否为 None 或空列表
+        if attention_logits is None:
+            self.logger.warning("attention_logits 是 None，返回零损失")
+            return torch.tensor(0.0, requires_grad=True, device=device)
+            
+        # 2. 如果是单个张量，转换为列表以统一处理
+        if not isinstance(attention_logits, list):
+            attention_logits = [attention_logits]
+            
+        # 3. 检查列表是否为空
+        if len(attention_logits) == 0:
+            self.logger.warning("attention_logits 是空列表，返回零损失")
+            return torch.tensor(0.0, requires_grad=True, device=device)
+            
+        # 4. 找出第一个有效的张量，用于确定设备
+        valid_tensor = None
+        for tensor in attention_logits:
+            if tensor is not None and isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+                valid_tensor = tensor
+                device = tensor.device
+                break
+                
+        # 5. 检查是否找到了有效张量
+        if valid_tensor is None:
+            self.logger.warning("attention_logits 中没有有效的张量，返回零损失")
+            return torch.tensor(0.0, requires_grad=True, device=device)
+            
+        # 6. 检查 text_masks 是否为 None
+        if text_masks is None:
+            self.logger.warning("text_masks 是 None，返回零损失")
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # 7. 过滤掉 None 值和无效张量
+        valid_attention_logits = []
+        for i, attn_map in enumerate(attention_logits):
+            if attn_map is None:
+                self.logger.warning(f"第 {i} 个 attention_map 是 None，跳过")
+                continue
+            if not isinstance(attn_map, torch.Tensor):
+                self.logger.warning(f"第 {i} 个 attention_map 不是 Tensor，跳过")
+                continue
+            if attn_map.numel() == 0:
+                self.logger.warning(f"第 {i} 个 attention_map 是空 Tensor，跳过")
+                continue
+            if torch.isnan(attn_map).any():
+                self.logger.warning(f"第 {i} 个 attention_map 包含 NaN 值，尝试修复")
+                attn_map = torch.where(torch.isnan(attn_map), torch.zeros_like(attn_map), attn_map)
+            
+            valid_attention_logits.append(attn_map)
+        
+        # 8. 检查有效张量数量
+        num_maps = len(valid_attention_logits)
+        if num_maps == 0:
+            self.logger.warning("过滤后没有有效的 attention_map，返回零损失")
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # 9. 动态生成权重 - 确保权重数量与有效张量数量匹配
+        if num_maps >= 3:
+            # 如果有足够数量的 attention_map，给予最后两层更高的权重
+            weights = [0.1] * (num_maps - 2) + [0.3, 0.3]
+        else:
+            # 否则均匀分配权重
+            weights = [1.0 / num_maps] * num_maps
+            
+        # 归一化权重
+        weights = [w / sum(weights) for w in weights]
+        
+        # 10. 计算加权损失
+        total_loss = 0
+        for i, attn_map in enumerate(valid_attention_logits):
+            try:
+                loss = self.compute_single_loss(attn_map, text_masks)
+                total_loss += weights[i] * loss
+            except Exception as e:
+                self.logger.error(f"计算第 {i} 个 attention_map 的损失时出错: {e}")
+                continue
+        
+        # 11. 返回加权总损失
+        return self.loss_weight * total_loss

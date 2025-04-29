@@ -187,9 +187,8 @@ class TGSRDataset(data.Dataset):
         self.pulse_tensor[10, 10] = 1
         
         # 控制映射权重
-        self.canny_weight = opt.get('canny_weight', 0.4)
-        self.depth_weight = opt.get('depth_weight', 0.3)
-        self.mask_weight = opt.get('mask_weight', 0.3)
+        self.canny_weight = opt.get('canny_weight', 0.5)
+        self.depth_weight = opt.get('depth_weight', 0.5)
 
     def _get_paths_from_folder(self, folder):
         """获取文件夹中的图像路径"""
@@ -246,46 +245,18 @@ class TGSRDataset(data.Dataset):
             h, w = img_gt.shape[:2]
             return np.zeros((h, w), dtype=np.float32)
     
-    def _generate_mask_map(self, objects_info, h, w):
-        """从对象信息生成掩码图"""
-        mask = np.zeros((h, w), dtype=np.float32)
-        
-        if not objects_info:
-            return mask
-        
-        for obj in objects_info:
-            if 'mask_encoded' in obj:
-                try:
-                    obj_mask = decode_mask(obj['mask_encoded'])
-                    if obj_mask is not None and obj_mask.sum() > 0:
-                        # 调整掩码大小
-                        if obj_mask.shape != (h, w):
-                            obj_mask_resized = cv2.resize(obj_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-                        else:
-                            obj_mask_resized = obj_mask
-                        
-                        # 合并掩码
-                        mask = np.maximum(mask, obj_mask_resized.astype(np.float32))
-                except Exception as e:
-                    self.logger.warning(f"掩码处理错误: {e}")
-                    continue
-        
-        return mask
-    
     def _create_control_map(self, img_gt, objects_info):
-        """创建三通道控制映射：Canny边缘、深度图和对象掩码"""
+        """创建二通道控制映射：Canny边缘和深度图"""
         h, w = img_gt.shape[:2]
         
         # 生成各通道
         canny_map = self._generate_canny_map(img_gt) if self.use_canny else np.zeros((h, w), dtype=np.float32)
         depth_map = self._generate_depth_map(img_gt) if self.use_depth_model else np.zeros((h, w), dtype=np.float32)
-        mask_map = self._generate_mask_map(objects_info, h, w)
         
-        # 创建三通道控制映射并应用权重
+        # 创建二通道控制映射并应用权重
         control_map = np.stack([
             canny_map * self.canny_weight,
-            depth_map * self.depth_weight,
-            mask_map * self.mask_weight
+            depth_map * self.depth_weight
         ], axis=2)
         
         return control_map
