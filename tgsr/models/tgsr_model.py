@@ -104,6 +104,19 @@ class TGCESRModel(SRGANModel):
                         trainable_params += param.numel()
                     logger.info(f"ControlNet 可训练参数数量: {trainable_params:,}")
                     
+                    # 加载预训练的ControlNet权重（如果有）
+                    load_path = self.opt['path'].get('pretrain_network_control', None)
+                    if load_path is not None and load_path != '~':
+                        try:
+                            logger.info(f'加载预训练的ControlNet: {load_path}')
+                            param_key = self.opt['path'].get('param_key_control', 'params')
+                            self.load_network(self.net_control, load_path, self.opt['path'].get('strict_load_control', True), param_key)
+                            logger.info(f'成功加载预训练的ControlNet权重')
+                        except Exception as e:
+                            logger.error(f'加载预训练的ControlNet失败: {e}')
+                    else:
+                        logger.info('未指定预训练的ControlNet权重，将从头训练')
+                    
                     # 根据配置选择是否冻结SR网络
                     freeze_original = self.opt.get('freeze_original', True)
                     if freeze_original:
@@ -152,29 +165,40 @@ class TGCESRModel(SRGANModel):
         
         # 第6步：设置优化器
         self.setup_optimizers()
+        
+        # 第7步：检查是否需要冻结判别器（基于学习率）
+        if self.is_train:
+            optim_d_lr = train_opt.get('optim_d', {}).get('lr', 0)
+            if optim_d_lr == 0:
+                logger.info('判别器学习率为0，冻结判别器')
+                self.freeze_discriminator = True
+                for p in self.net_d.parameters():
+                    p.requires_grad = False
+                self.net_d.eval()
+            else:
+                self.freeze_discriminator = False
+                logger.info(f'判别器学习率为{optim_d_lr}，启用判别器训练')
 
     def setup_optimizers(self):
-        """重写setup_optimizers方法，增加对ControlNet的支持"""
+        """重写setup_optimizers方法，增加对ControlNet的支持，移除stages相关逻辑"""
         logger = get_root_logger()
         train_opt = self.opt['train']
         
         # 清空优化器列表
         self.optimizers = []
         
-        # 判别器优化器
+        # 判别器优化器（如果不冻结）
         optim_d_config = train_opt['optim_d'].copy()
         optim_type = optim_d_config.pop('type')
-        if 'lr' in optim_d_config:
-            optim_d_config.pop('lr')
+        lr_d = optim_d_config.pop('lr') if 'lr' in optim_d_config else 0
         
-        init_lr_d = train_opt['stages'][0]['lr_d'] if 'stages' in train_opt else train_opt.get('lr_d')
-        self.optimizer_d = self.get_optimizer(optim_type, self.net_d.parameters(), lr=init_lr_d, **optim_d_config)
-        
-        # 确保每个参数组都有initial_lr参数
-        for param_group in self.optimizer_d.param_groups:
-            param_group['initial_lr'] = param_group['lr']
-        
-        self.optimizers.append(self.optimizer_d)
+        if lr_d > 0:
+            self.optimizer_d = self.get_optimizer(optim_type, self.net_d.parameters(), lr=lr_d, **optim_d_config)
+            # 确保每个参数组都有initial_lr参数
+            for param_group in self.optimizer_d.param_groups:
+                param_group['initial_lr'] = param_group['lr']
+            self.optimizers.append(self.optimizer_d)
+            logger.info(f'创建判别器优化器，学习率: {lr_d}')
         
         # ControlNet优化器（如果有ControlNet）
         if hasattr(self, 'net_control') and self.net_control is not None:
@@ -182,9 +206,7 @@ class TGCESRModel(SRGANModel):
             if 'optim_control' in train_opt:
                 optim_config = train_opt['optim_control'].copy()
                 optim_type = optim_config.pop('type')
-                
-                if 'lr' in optim_config:
-                    optim_config.pop('lr')
+                lr_control = optim_config.pop('lr') if 'lr' in optim_config else 5e-5
                 
                 # 收集ControlNet参数
                 optim_params_control = []
@@ -198,19 +220,66 @@ class TGCESRModel(SRGANModel):
                         if v.requires_grad:
                             optim_params_control.append(v)
                 
-                init_lr_control = train_opt['stages'][0].get('lr_control') if 'stages' in train_opt else train_opt.get('lr_control')
-                
                 if optim_params_control:
-                    self.optimizer_control = self.get_optimizer(optim_type, optim_params_control, lr=init_lr_control, **optim_config)
+                    self.optimizer_control = self.get_optimizer(optim_type, optim_params_control, lr=lr_control, **optim_config)
                     # 确保每个参数组都有initial_lr参数
                     for param_group in self.optimizer_control.param_groups:
                         param_group['initial_lr'] = param_group['lr']
                     self.optimizers.append(self.optimizer_control)
+                    logger.info(f'创建ControlNet优化器，学习率: {lr_control}')
         
         logger.info(f"优化器设置完成，共有 {len(self.optimizers)} 个优化器")
+        
+        # 设置学习率调度器
+        self.setup_schedulers()
+
+    def setup_schedulers(self):
+        """重写setup_schedulers方法，确保学习率调度器正确设置"""
+        train_opt = self.opt['train']
+        logger = get_root_logger()
+        
+        # 清空现有调度器
+        self.schedulers = []
+        
+        # 检查是否有调度器配置
+        if 'scheduler' not in train_opt:
+            logger.info("未找到学习率调度器配置，跳过调度器设置")
+            return
+            
+        scheduler_type = train_opt['scheduler'].get('type')
+        if not scheduler_type:
+            logger.warning("学习率调度器类型未指定，跳过调度器设置")
+            return
+            
+        # 创建调度器的深拷贝，防止修改原始配置
+        scheduler_config = train_opt['scheduler'].copy()
+        scheduler_config.pop('type')
+        
+        logger.info(f"设置学习率调度器: {scheduler_type}")
+        
+        # 为每个优化器设置调度器
+        from basicsr.models import lr_scheduler
+        
+        for i, optimizer in enumerate(self.optimizers):
+            optimizer_name = "判别器" if i == 0 and hasattr(self, 'optimizer_d') else "ControlNet"
+            
+            if scheduler_type == 'MultiStepLR':
+                scheduler = lr_scheduler.MultiStepRestartLR(optimizer, **scheduler_config)
+            elif scheduler_type == 'MultiStepRestartLR':
+                scheduler = lr_scheduler.MultiStepRestartLR(optimizer, **scheduler_config)
+            elif scheduler_type == 'CosineAnnealingRestartLR':
+                scheduler = lr_scheduler.CosineAnnealingRestartLR(optimizer, **scheduler_config)
+            else:
+                logger.warning(f"不支持的调度器类型: {scheduler_type}，跳过为{optimizer_name}设置调度器")
+                continue
+                
+            self.schedulers.append(scheduler)
+            logger.info(f"为{optimizer_name}优化器创建{scheduler_type}调度器")
+        
+        logger.info(f"调度器设置完成，共有 {len(self.schedulers)} 个调度器")
 
     def optimize_parameters(self, current_iter):
-        """优化参数，整合SR网络和ControlNet"""
+        """优化参数，整合SR网络和ControlNet，移除stages相关逻辑"""
         logger = get_root_logger()
         # 保存当前迭代次数
         self.iter = current_iter
@@ -218,43 +287,6 @@ class TGCESRModel(SRGANModel):
         # 检查使用的架构类型
         use_controlnet = hasattr(self, 'net_control') and hasattr(self, 'optimizer_control')
     
-        # 检查是否处于阶段转换点
-        if self.opt['train'].get('stage_train'):
-            self.current_stage_idx = 0
-            
-            # 计算每个阶段的起始点
-            accumulated_iters = 0
-            for idx, stage in enumerate(self.opt['train']['stages']):
-                start_iter = accumulated_iters
-                accumulated_iters += stage['iters']
-                end_iter = accumulated_iters
-                
-                # 如果当前迭代在这个阶段的范围内，设置当前阶段索引
-                if start_iter <= current_iter < end_iter:
-                    self.current_stage_idx = idx
-                    
-                # 检查是否精确处于阶段切换点（前一阶段的结束=当前阶段的开始）
-                if idx > 0 and current_iter == start_iter:
-                    logger.info(f'进入阶段 {stage["name"]} 在迭代 {current_iter}')
-                    
-                    # 设置学习率 - 只设置判别器和ControlNet的学习率
-                    for param_group in self.optimizer_d.param_groups:
-                        param_group['lr'] = stage['lr_d']
-                        param_group['initial_lr'] = stage['lr_d']
-                    
-                    if use_controlnet:
-                        lr_control = stage.get('lr_control')
-                        for param_group in self.optimizer_control.param_groups:
-                            param_group['lr'] = lr_control
-                            param_group['initial_lr'] = lr_control
-                    
-                    # 对于特定阶段的特殊处理
-                    if idx == 1:  # 从预训练到联合轻度训练阶段
-                        # 重新初始化判别器的某些层参数，避免梯度爆炸
-                        for name, m in self.net_d.named_modules():
-                            if isinstance(m, nn.Conv2d) and 'final' not in name:
-                                nn.init.normal_(m.weight, 0, 0.02)
-        
         # 定期清理CUDA缓存以减少内存碎片
         if current_iter % 50 == 0:
             torch.cuda.empty_cache()
@@ -295,15 +327,15 @@ class TGCESRModel(SRGANModel):
                 l_g_total += l_g_style
                 loss_dict['l_g_style'] = l_g_style
                 
-        # GAN损失
-        fake_g_pred = self.net_d(self.output)
-        l_g_gan = self.cri_gan(fake_g_pred, True, is_disc=False)
-        
-        # 调整GAN损失权重
-        gan_weight = self.opt.get('train').get('gan_opt').get('loss_weight')
-        l_g_total += l_g_gan * gan_weight
-        loss_dict['l_g_gan'] = l_g_gan
-        loss_dict['l_g_gan_weighted'] = l_g_gan * gan_weight
+        # GAN损失 - 如果判别器未冻结
+        if not getattr(self, 'freeze_discriminator', False):
+            fake_g_pred = self.net_d(self.output)
+            l_g_gan = self.cri_gan(fake_g_pred, True, is_disc=False)
+            
+            # 调整GAN损失权重
+            gan_weight = self.opt.get('train').get('gan_opt').get('loss_weight')
+            l_g_total += l_g_gan * gan_weight
+            loss_dict['l_g_gan'] = l_g_gan
 
         if hasattr(self, 'cri_clip') and self.use_text_features:
             l_clip = self.cri_clip(self.output, self.text_prompts)
@@ -312,10 +344,8 @@ class TGCESRModel(SRGANModel):
             clip_weight = self.opt.get('train').get('clip_opt').get('loss_weight')
             l_g_total += l_clip * clip_weight
             loss_dict['l_clip'] = l_clip
-            loss_dict['l_clip_weighted'] = l_clip * clip_weight 
             
             # 动态调整CLIP权重 - 防止在训练早期占比过大
-            # TODO: 这个权重调整策略有待优化
             if hasattr(self, 'iter'):
                 current_iter = self.iter
                 if current_iter < 20000:  # 前20k次迭代降低CLIP损失权重
@@ -396,26 +426,8 @@ class TGCESRModel(SRGANModel):
             torch.cuda.empty_cache()
         
         # ====================== 第3部分：判别器更新 ======================
-        # 判别器跳过条件 - 可以根据阶段自定义
-        skip_d_update = False
-        current_stage_idx = 0
-        
-        # 获取当前所处阶段
-        if self.opt['train'].get('stage_train'):
-            stages = self.opt['train']['stages']
-            for idx, stage in enumerate(stages):
-                if current_iter < stage['iters'] or idx == len(stages) - 1 and current_iter >= stage['iters']:
-                    current_stage_idx = idx
-                    break
-        
-        # 在预训练阶段可能需要跳过判别器更新
-        if current_stage_idx == 0 and self.opt['train'].get('stage_train'):
-            first_stage = self.opt['train']['stages'][0]
-            if first_stage.get('lr_d', 0) == 0:
-                skip_d_update = True
-        
-        # 优化判别器（除非需要跳过）
-        if not skip_d_update:
+        # 只在判别器未被冻结时更新
+        if not getattr(self, 'freeze_discriminator', False):
             for p in self.net_d.parameters():
                 p.requires_grad = True
 
@@ -582,7 +594,7 @@ class TGCESRModel(SRGANModel):
                 self.objects_info = None
         
         if self.is_train:
-            # 训练数据合成 - 修改为先缩放再退化
+            # 训练数据合成 - 使用RealESRGAN方式的二阶退化
             self.gt = data['gt'].to(self.device)
             self.gt_usm = self.usm_sharpener(self.gt)
 
@@ -592,14 +604,20 @@ class TGCESRModel(SRGANModel):
 
             ori_h, ori_w = self.gt.size()[2:4]
             
-            # 先进行缩放 - 先缩放再退化
-            scale = self.opt['scale']
-            mode = random.choice(['area', 'bilinear', 'bicubic'])
-            out = F.interpolate(self.gt_usm, size=(ori_h // scale, ori_w // scale), mode=mode)
-
             # ----------------------- 第一阶段退化过程 ----------------------- #
             # 模糊
-            out = filter2D(out, self.kernel1)
+            out = filter2D(self.gt_usm, self.kernel1)
+            
+            # 随机缩放 - 上采样、下采样或保持不变
+            updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob'])[0]
+            if updown_type == 'up':
+                scale = np.random.uniform(1, self.opt['resize_range'][1])
+            elif updown_type == 'down':
+                scale = np.random.uniform(self.opt['resize_range'][0], 1)
+            else:
+                scale = 1
+            mode = random.choice(['area', 'bilinear', 'bicubic'])
+            out = F.interpolate(out, scale_factor=scale, mode=mode)
             
             # 添加噪声
             gray_noise_prob = self.opt['gray_noise_prob']
@@ -621,6 +639,21 @@ class TGCESRModel(SRGANModel):
             # 模糊
             if np.random.uniform() < self.opt['second_blur_prob']:
                 out = filter2D(out, self.kernel2)
+            
+            # 随机缩放 - 上采样、下采样或保持不变
+            updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob2'])[0]
+            if updown_type == 'up':
+                scale = np.random.uniform(1, self.opt['resize_range2'][1])
+            elif updown_type == 'down':
+                scale = np.random.uniform(self.opt['resize_range2'][0], 1)
+            else:
+                scale = 1
+            mode = random.choice(['area', 'bilinear', 'bicubic'])
+            
+            # 最终缩放到目标尺寸 (把尺寸调整为 ori_h/scale x ori_w/scale)
+            target_h = int(ori_h / self.opt['scale'] * scale)
+            target_w = int(ori_w / self.opt['scale'] * scale)
+            out = F.interpolate(out, size=(target_h, target_w), mode=mode)
                 
             # 添加噪声
             gray_noise_prob = self.opt['gray_noise_prob2']
@@ -633,13 +666,35 @@ class TGCESRModel(SRGANModel):
                     out, scale_range=self.opt['poisson_scale_range2'], 
                     gray_prob=gray_noise_prob, clip=True, rounds=False)
   
-            # JPEG压缩
-            jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range2'])
-            out = torch.clamp(out, 0, 1)
-            out = self.jpeger(out, quality=jpeg_p)
-            
-            # 最终的sinc滤波
-            out = filter2D(out, self.sinc_kernel)
+            # JPEG压缩 + 最终的sinc滤波
+            # 考虑两种顺序：
+            # 1. [缩放到最终尺寸 + sinc滤波] + JPEG压缩
+            # 2. JPEG压缩 + [缩放到最终尺寸 + sinc滤波]
+            final_sinc_prob = self.opt.get('final_sinc_prob', 0.8)
+            if np.random.uniform() < 0.5:
+                # 缩放到最终尺寸 + sinc滤波
+                mode = random.choice(['area', 'bilinear', 'bicubic'])
+                out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
+                # 随机决定是否应用sinc滤波
+                if np.random.uniform() < final_sinc_prob:
+                    out = filter2D(out, self.sinc_kernel)
+                # JPEG压缩
+                jpeg_range2 = self.opt['jpeg_range2']
+                jpeg_p = out.new_zeros(out.size(0)).uniform_(*jpeg_range2)
+                out = torch.clamp(out, 0, 1)
+                out = self.jpeger(out, quality=jpeg_p)
+            else:
+                # JPEG压缩
+                jpeg_range2 = self.opt['jpeg_range2']
+                jpeg_p = out.new_zeros(out.size(0)).uniform_(*jpeg_range2)
+                out = torch.clamp(out, 0, 1)
+                out = self.jpeger(out, quality=jpeg_p)
+                # 缩放到最终尺寸 + sinc滤波
+                mode = random.choice(['area', 'bilinear', 'bicubic'])
+                out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
+                # 随机决定是否应用sinc滤波
+                if np.random.uniform() < final_sinc_prob:
+                    out = filter2D(out, self.sinc_kernel)
             
             # clamp and round
             self.lq = torch.clamp((out * 255.0).round(), 0, 255) / 255.
@@ -727,45 +782,6 @@ class TGCESRModel(SRGANModel):
                 
                 # 清理临时变量
                 del self.raw_control_map
-
-    def apply_text_guidance(self, features, text_hidden=None, text_pooled=None, block_idx=None):
-        """应用文本引导到特征图
-        
-        Args:
-            features: 要增强的特征图
-            text_hidden: 文本隐藏状态
-            text_pooled: 文本池化表示
-            block_idx: RRDB块的索引，用于损失计算
-        """
-        if not self.use_text_features or not hasattr(self, 'net_t'):
-            return features, None
-        
-        # 如果未提供文本特征，则编码文本提示
-        if text_hidden is None or text_pooled is None:
-            text_hidden, text_pooled = self.encode_text(self.text_prompts)
-        
-        # 创建位置编码（如果需要）
-        position_info = None
-        if block_idx is not None and hasattr(self.net_t, 'with_position') and self.net_t.with_position:
-            # 如果文本引导网络支持位置信息，可以创建位置编码
-            # 例如，可以使用one-hot编码表示位置
-            num_blocks = len(self.net_g.body)
-            position_info = torch.zeros(features.size(0), num_blocks, device=features.device)
-            position_info[:, block_idx] = 1.0
-        
-        # 应用文本引导
-        if position_info is not None:
-            enhanced_features, attention_logits = self.net_t(features, text_hidden, text_pooled, position_info)
-        else:
-            enhanced_features, attention_logits = self.net_t(features, text_hidden, text_pooled)
-        
-        # 存储块位置信息和注意力图，供损失函数使用
-        if self.is_train and attention_logits is not None:
-            if not hasattr(self, 'current_attention_maps') or self.current_attention_maps is None:
-                self.current_attention_maps = {}
-            self.current_attention_maps[block_idx] = attention_logits
-        
-        return enhanced_features, attention_logits
     
     def forward_sr_network(self, x, apply_guidance=True):
         """SR网络的前向传播，使用ControlNet实现文本引导
@@ -853,7 +869,7 @@ class TGCESRModel(SRGANModel):
         return out
     
     def nondist_validation(self, dataloader, current_iter, tb_logger, save_img):
-        """验证过程，修改为先缩放再退化进行测试，有对比图，热力图，ControlMap可视化"""
+        """验证过程，使用与训练一致的缩放和退化方法进行验证"""
         self.is_train = False
         
         dataset_name = dataloader.dataset.opt['name']
@@ -897,7 +913,7 @@ class TGCESRModel(SRGANModel):
             if 'lq' in val_data:
                 self.lq = val_data['lq'].to(self.device)
             elif 'gt' in val_data:
-                # 如果没有提供LQ，则从GT生成LQ图像（与训练过程一致 - 先缩放再退化）
+                # 如果没有提供LQ，则从GT使用与训练一致的方式生成LQ图像
                 if not hasattr(self, 'jpeger'):
                     self.jpeger = DiffJPEG(differentiable=False).cuda()
                 if not hasattr(self, 'usm_sharpener'):
@@ -912,14 +928,20 @@ class TGCESRModel(SRGANModel):
 
                 ori_h, ori_w = self.gt.size()[2:4]
                 
-                # 先进行缩放 - 先缩放再退化
-                scale = self.opt['scale']
-                mode = random.choice(['area', 'bilinear', 'bicubic'])
-                out = F.interpolate(self.gt_usm, size=(ori_h // scale, ori_w // scale), mode=mode)
-
                 # ----------------------- 第一阶段退化过程 ----------------------- #
                 # 模糊
-                out = filter2D(out, self.kernel1)
+                out = filter2D(self.gt_usm, self.kernel1)
+                
+                # 随机缩放 - 上采样、下采样或保持不变
+                updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob'])[0]
+                if updown_type == 'up':
+                    scale = np.random.uniform(1, self.opt['resize_range'][1])
+                elif updown_type == 'down':
+                    scale = np.random.uniform(self.opt['resize_range'][0], 1)
+                else:
+                    scale = 1
+                mode = random.choice(['area', 'bilinear', 'bicubic'])
+                out = F.interpolate(out, scale_factor=scale, mode=mode)
                 
                 # 添加噪声
                 gray_noise_prob = self.opt['gray_noise_prob']
@@ -947,6 +969,21 @@ class TGCESRModel(SRGANModel):
                 second_blur_prob = self.opt['second_blur_prob']
                 if np.random.uniform() < second_blur_prob:
                     out = filter2D(out, self.kernel2)
+                
+                # 随机缩放 - 上采样、下采样或保持不变
+                updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob2'])[0]
+                if updown_type == 'up':
+                    scale = np.random.uniform(1, self.opt['resize_range2'][1])
+                elif updown_type == 'down':
+                    scale = np.random.uniform(self.opt['resize_range2'][0], 1)
+                else:
+                    scale = 1
+                mode = random.choice(['area', 'bilinear', 'bicubic'])
+                
+                # 最终缩放到目标尺寸 (把尺寸调整为 ori_h/scale x ori_w/scale)
+                target_h = int(ori_h / self.opt['scale'] * scale)
+                target_w = int(ori_w / self.opt['scale'] * scale)
+                out = F.interpolate(out, size=(target_h, target_w), mode=mode)
                     
                 # 添加噪声
                 gray_noise_prob2 = self.opt['gray_noise_prob2']
@@ -963,21 +1000,42 @@ class TGCESRModel(SRGANModel):
                         out, scale_range=poisson_scale_range2, 
                         gray_prob=gray_noise_prob2, clip=True, rounds=False)
       
-                # JPEG压缩
-                jpeg_range2 = self.opt['jpeg_range2'] if 'jpeg_range2' in self.opt else [40, 95]
-                jpeg_p = out.new_zeros(out.size(0)).uniform_(*jpeg_range2)
-                out = torch.clamp(out, 0, 1)
-                out = self.jpeger(out, quality=jpeg_p)
-                
-                # 最终的sinc滤波
-                out = filter2D(out, self.sinc_kernel)
+                # JPEG压缩 + 最终的sinc滤波
+                # 考虑两种顺序：
+                # 1. [缩放到最终尺寸 + sinc滤波] + JPEG压缩
+                # 2. JPEG压缩 + [缩放到最终尺寸 + sinc滤波]
+                final_sinc_prob = self.opt.get('final_sinc_prob', 0.8)
+                if np.random.uniform() < 0.5:
+                    # 缩放到最终尺寸 + sinc滤波
+                    mode = random.choice(['area', 'bilinear', 'bicubic'])
+                    out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
+                    # 随机决定是否应用sinc滤波
+                    if np.random.uniform() < final_sinc_prob:
+                        out = filter2D(out, self.sinc_kernel)
+                    # JPEG压缩
+                    jpeg_range2 = self.opt['jpeg_range2']
+                    jpeg_p = out.new_zeros(out.size(0)).uniform_(*jpeg_range2)
+                    out = torch.clamp(out, 0, 1)
+                    out = self.jpeger(out, quality=jpeg_p)
+                else:
+                    # JPEG压缩
+                    jpeg_range2 = self.opt['jpeg_range2']
+                    jpeg_p = out.new_zeros(out.size(0)).uniform_(*jpeg_range2)
+                    out = torch.clamp(out, 0, 1)
+                    out = self.jpeger(out, quality=jpeg_p)
+                    # 缩放到最终尺寸 + sinc滤波
+                    mode = random.choice(['area', 'bilinear', 'bicubic'])
+                    out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
+                    # 随机决定是否应用sinc滤波
+                    if np.random.uniform() < final_sinc_prob:
+                        out = filter2D(out, self.sinc_kernel)
                 
                 # clamp and round
                 self.lq = torch.clamp((out * 255.0).round(), 0, 255) / 255.
 
                 # 确保GT和lq尺寸匹配
                 target_h, target_w = self.lq.size()[2:4]  # lq尺寸
-                gt_h, gt_w = target_h * scale, target_w * scale  # 期望的gt尺寸
+                gt_h, gt_w = target_h * self.opt['scale'], target_w * self.opt['scale']  # 期望的gt尺寸
                 
                 # 如果GT尺寸不匹配，则调整GT和gt_usm的尺寸
                 if self.gt.size(2) != gt_h or self.gt.size(3) != gt_w:
@@ -1383,12 +1441,29 @@ class TGCESRModel(SRGANModel):
         return attention_dict
     
     def save(self, epoch, current_iter):
-        """保存模型 - 只保存ControlNet（MultiControlNet）网络"""
-        # TODO: 只保存ControlNet（包括Canny、Depth、Mask），不保存SR网络，因为冻结了RRDBNet和Clip，然后如果需要支持恢复训练，需要保存DiscriminatorNet，存储空间不够了
+        """保存模型 - 同时保存ControlNet（MultiControlNet）网络和判别器网络"""
+        logger = get_root_logger()
+        
+        # 1. 保存ControlNet
         if hasattr(self, 'net_control'):
+            logger.info(f'正在保存ControlNet（迭代次数: {current_iter}）')
             self.save_network(self.net_control, 'net_control', current_iter)
-
-        # TODO: 感觉暂时可以不用保存  
+        
+        # 2. 条件保存判别器（如果未冻结）
+        if not getattr(self, 'freeze_discriminator', False) and hasattr(self, 'net_d'):
+            logger.info(f'正在保存判别器（迭代次数: {current_iter}）')
+            self.save_network(self.net_d, 'net_d', current_iter)
+            
+        # 3. 保存带EMA的生成器网络
+        if hasattr(self, 'net_g_ema'):
+            logger.info(f'正在保存带EMA的SR网络（迭代次数: {current_iter}）')
+            self.save_network([self.net_g, self.net_g_ema], 'net_g', current_iter, param_key=['params', 'params_ema'])
+        elif not self.opt.get('freeze_original', True):
+            # 只有当原始网络可训练时才保存
+            logger.info(f'正在保存SR网络（迭代次数: {current_iter}）')
+            self.save_network(self.net_g, 'net_g', current_iter)
+        
+        # 4. 保存训练状态，用于恢复训练
         self.save_training_state(epoch, current_iter)
     
     def save_gradcam_attention(self, img, attention_maps, img_name, save_path, iter_num):

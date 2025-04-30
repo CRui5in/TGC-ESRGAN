@@ -14,7 +14,7 @@ mkdir -p "$PROJECT_ROOT/tb_logger/"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="$PROJECT_ROOT/logs/tgc_esrgan_train_log_${TIMESTAMP}.log"
 
-CONFIG="$PROJECT_ROOT/options/train_tgsr_controlnet_x4plus.yml"
+CONFIG="$PROJECT_ROOT/options/train_pre_tgcesrgan_x4plus.yml"
 
 echo "开始TGC-ESRGAN训练..." | tee -a "$LOG_FILE"
 cd $SCRIPT_DIR

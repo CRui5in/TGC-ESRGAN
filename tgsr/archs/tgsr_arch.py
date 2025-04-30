@@ -26,10 +26,16 @@ class MultiControlNet(nn.Module):
                 text_dim=512, 
                 num_heads=8,
                 with_position=False,
-                control_in_channels=2):  # Canny + 深度图
+                control_in_channels=2,  # Canny + 深度图
+                use_cat_fusion=True):  # 是否使用拼接融合而非加法融合
         super().__init__()
         
         self.with_position = with_position
+        self.use_cat_fusion = use_cat_fusion
+        
+        # 控制缩放系数 - 为每个控制信号设置独立的缩放系数
+        # 初始化为1.0，可以在训练期间调整
+        self.register_buffer('control_scales', torch.ones(9))  # conv_first + 8个RRDB块
         
         # 控制输入编码器
         self.control_encoder = nn.Sequential(
@@ -77,6 +83,19 @@ class MultiControlNet(nn.Module):
             
             # 确保所有其他模块都是可以访问的
             self.orig_total_blocks = len(orig_net_g.body)
+            
+            # 如果使用拼接融合，添加额外的处理层
+            if self.use_cat_fusion:
+                self.cat_fusion_layers = nn.ModuleList()
+                # 为conv_first输出创建一个融合层
+                self.cat_fusion_layers.append(
+                    nn.Conv2d(num_feat * 2, num_feat, kernel_size=1)
+                )
+                # 为每个RRDB块创建一个融合层
+                for _ in range(trainable_blocks):
+                    self.cat_fusion_layers.append(
+                        nn.Conv2d(num_feat * 2, num_feat, kernel_size=1)
+                    )
         
         # 零初始化控制块
         self.zero_conv_first = ZeroConvBlock(num_feat, num_feat, text_dim)
@@ -138,6 +157,17 @@ class MultiControlNet(nn.Module):
         )
         
         self._initialize_weights()
+    
+    def set_control_scales(self, scales):
+        """设置控制缩放系数
+        
+        Args:
+            scales: 控制缩放系数列表或tensor
+        """
+        if isinstance(scales, (list, tuple)):
+            scales = torch.tensor(scales, device=self.control_scales.device)
+        assert len(scales) == len(self.control_scales), f"控制缩放系数长度不匹配: {len(scales)} vs {len(self.control_scales)}"
+        self.control_scales.copy_(scales)
     
     def _initialize_weights(self):
         """初始化网络权重"""
@@ -207,8 +237,17 @@ class MultiControlNet(nn.Module):
             feat, text_hidden, text_feat, control_feat, 0
         )
         
-        # 添加控制信号 - 简单的加法融合
-        feat = feat + control_signal
+        # 应用控制缩放系数
+        control_signal = control_signal * self.control_scales[0]
+        
+        # 根据融合模式添加控制信号
+        if self.use_cat_fusion:
+            # 拼接融合
+            feat = torch.cat([feat, control_signal], dim=1)
+            feat = self.cat_fusion_layers[0](feat)
+        else:
+            # 加法融合
+            feat = feat + control_signal
         
         attention_maps = [attn_map]
         
@@ -223,8 +262,18 @@ class MultiControlNet(nn.Module):
                 trunk, text_hidden, text_feat, control_feat, i+1
             )
             
-            # 添加控制信号 - 简单的加法融合
-            trunk = trunk + control_signal
+            # 应用控制缩放系数
+            control_signal = control_signal * self.control_scales[i+1]
+            
+            # 根据融合模式添加控制信号
+            if self.use_cat_fusion:
+                # 拼接融合
+                trunk = torch.cat([trunk, control_signal], dim=1)
+                trunk = self.cat_fusion_layers[i+1](trunk)
+            else:
+                # 加法融合
+                trunk = trunk + control_signal
+                
             attention_maps.append(attn_map)
         
         return trunk, attention_maps
@@ -326,48 +375,33 @@ class MultiHeadSelfAttention(nn.Module):
 
 
 class ZeroConvBlock(nn.Module):
-    """零初始化卷积块 - ControlNet核心组件"""
-    def __init__(self, in_channels, out_channels, text_dim=512):
+    """零初始化卷积块 - ControlNet核心组件
+    
+    使用1×1卷积实现ControlNet原始零卷积模块
+    """
+    def __init__(self, in_channels, out_channels, text_dim):
         super().__init__()
-        # 第一个卷积
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.norm1 = nn.GroupNorm(8, out_channels)
-        self.act1 = nn.SiLU()
-        
-        # 第二个卷积 - 真正的零初始化
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        # 使用1×1卷积实现零卷积
+        self.zero_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0)
         # 完全零初始化权重
-        nn.init.zeros_(self.conv2.weight)
-        nn.init.zeros_(self.conv2.bias)
-        
-        # 文本调制
-        self.text_proj = nn.Sequential(
-            nn.Linear(text_dim, out_channels),
-            nn.SiLU()
-        )
+        nn.init.zeros_(self.zero_conv.weight)
+        nn.init.zeros_(self.zero_conv.bias)
     
     def ensure_zero_init(self):
         """确保完全零初始化"""
-        nn.init.zeros_(self.conv2.weight)
-        nn.init.zeros_(self.conv2.bias)
+        nn.init.zeros_(self.zero_conv.weight)
+        nn.init.zeros_(self.zero_conv.bias)
     
-    def forward(self, x, text_embedding, text_hidden=None):
+    def forward(self, x, text_embedding=None, text_hidden=None):
         """
-        前向传播
+        前向传播 - 简化为单纯的零卷积
         Args:
             x: [B, C, H, W] - 输入特征
-            text_embedding: [B, C] - 文本特征
-            text_hidden: [B, L, D] - 文本隐藏状态（可选）
+            text_embedding: 文本特征（不再使用）
+            text_hidden: 文本隐藏状态（不再使用）
         """
-        # 第一个卷积层
-        h = self.conv1(x)
-        h = self.norm1(h)
-        h = self.act1(h)
-        
-        # 第二个卷积层 - 零初始化
-        h = self.conv2(h)
-        
-        return h
+        # 直接应用零卷积
+        return self.zero_conv(x)
 
 
 class CrossAttention(nn.Module):
