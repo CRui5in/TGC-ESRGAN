@@ -1,0 +1,286 @@
+# 基本设置
+name: train_TGC-ESRGAN_x4plus_controlnet_400k_B12G4
+model_type: TGCESRModel
+scale: 4
+num_gpu: auto
+manual_seed: 0
+
+# 训练数据合成选项
+# GT图像USM锐化
+l1_gt_usm: True
+percep_gt_usm: True
+gan_gt_usm: False
+
+# the first degradation process
+resize_prob: [0.2, 0.7, 0.1]  # up, down, keep
+resize_range: [0.3, 1.5]
+gaussian_noise_prob: 0.5
+noise_range: [1, 15]
+poisson_scale_range: [0.05, 1.5]
+gray_noise_prob: 0.4
+jpeg_range: [60, 95]
+
+# the second degradation process
+second_blur_prob: 0.8
+resize_prob2: [0.3, 0.4, 0.3]  # up, down, keep
+resize_range2: [0.3, 1.2]
+gaussian_noise_prob2: 0.5
+noise_range2: [1, 15]
+poisson_scale_range2: [0.05, 1.25]
+gray_noise_prob2: 0.4
+jpeg_range2: [60, 95]
+
+gt_size: 256
+queue_size: 144
+
+# CLIP文本编码器设置
+text_encoder:
+  name: "/root/autodl-tmp/clip-vit-large-patch14"
+  text_dim: 768
+  freeze: true
+
+# 数据集设置
+datasets:
+  train:
+    name: TGSR_train
+    type: TGSRDataset
+    dataroot_gt: /root/autodl-tmp/tgsr_dataset_hr_only/train/hr
+    text_file: /root/autodl-tmp/tgsr_dataset_hr_only/train_captions.json
+    io_backend:
+      type: disk
+
+    blur_kernel_size: 21
+    kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    sinc_prob: 0.1
+    blur_sigma: [0.2, 3]
+    betag_range: [0.5, 4]
+    betap_range: [1, 2]
+
+    blur_kernel_size2: 21
+    kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    sinc_prob2: 0.1
+    blur_sigma2: [0.2, 1.5]
+    betag_range2: [0.5, 4]
+    betap_range2: [1, 2]
+
+    final_sinc_prob: 0.8
+
+    gt_size: 256
+    use_hflip: False
+    use_rot: False
+
+    # 数据加载器
+    use_shuffle: true
+    num_worker_per_gpu: 2  
+    batch_size_per_gpu: 1  
+    dataset_enlarge_ratio: 1
+    prefetch_mode: cuda
+    pin_memory: true
+
+    # 控制映射
+    use_canny: true
+    canny_weight: 0.5
+    depth_weight: 0.5 
+
+    # 深度模型
+    use_depth_model: true
+    depth_model_path: "/root/autodl-tmp/dpt-large"
+
+    # Canny参数
+    canny_low: 100
+    canny_high: 200
+
+  val:
+    name: TGSR_val
+    type: TGSRDataset
+    dataroot_gt: /root/autodl-tmp/tgsr_dataset_hr_only/val/hr
+    text_file: /root/autodl-tmp/tgsr_dataset_hr_only/val_captions.json
+    io_backend:
+      type: disk
+
+    blur_kernel_size: 21
+    kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    sinc_prob: 0.1
+    blur_sigma: [0.2, 3]
+    betag_range: [0.5, 4]
+    betap_range: [1, 2]
+
+    blur_kernel_size2: 21
+    kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    sinc_prob2: 0.1
+    blur_sigma2: [0.2, 1.5]
+    betag_range2: [0.5, 4]
+    betap_range2: [1, 2]
+
+    final_sinc_prob: 0.8
+    gt_size: 256
+    use_hflip: False
+    use_rot: False
+    
+    num_worker_per_gpu: 2
+    batch_size_per_gpu: 1
+
+    # 控制映射
+    use_canny: true
+    canny_weight: 0.5
+    depth_weight: 0.5
+
+    # 深度模型
+    use_depth_model: true
+    depth_model_path: "/root/autodl-tmp/dpt-large"
+
+    # Canny参数
+    canny_low: 100
+    canny_high: 200
+
+# 网络结构
+# 基础SR网络
+network_g:
+  type: RRDBNet
+  num_in_ch: 3
+  num_out_ch: 3
+  num_feat: 64
+  num_block: 23
+  num_grow_ch: 32
+  scale: 4
+
+# ControlNet
+network_control:
+  type: MultiControlNet
+  num_feat: 64
+  text_dim: 768
+  num_heads: 8
+  with_position: true
+  control_in_channels: 2  # Canny + 深度
+
+# 判别器
+network_d:
+  type: UNetDiscriminatorSN
+  num_in_ch: 3
+  num_feat: 64
+  skip_connection: True
+
+# 路径设置
+path:
+  pretrain_network_g: /root/autodl-tmp/TGC-ESRGAN/RealESRNet_x4plus.pth
+  pretrain_network_control: /root/autodl-tmp/TGC-ESRGAN/TGC-ESRGAN_x4plus_pre.pth
+  param_key_g: params_ema
+  strict_load_g: true
+
+  resume_state: ~
+  experiments_root: /root/autodl-tmp/TGC-ESRGAN/experiments
+
+# 冻结原始SR网络
+freeze_original: true
+
+# 训练设置
+train:
+  ema_decay: 0.999
+  
+  # 预训练阶段优化器设置
+  optim_control:
+    type: Adam
+    lr: !!float 1e-4
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.999]
+  
+  optim_d:
+    type: Adam
+    lr: !!float 1e-5
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.999]
+  
+  # 预训练阶段学习率调度
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [100000, 100000, 100000, 100000]  # 预训练50k次迭代
+    restart_weights: [1, 1, 1, 1]
+    eta_min: !!float 1e-7
+
+  # 训练设置
+  total_iter: 400000
+  warmup_iter: -1
+
+  # 损失函数
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+  # 感知损失
+  perceptual_opt:
+    type: PerceptualLoss
+    layer_weights:
+      'conv1_2': 0.1
+      'conv2_2': 0.1
+      'conv3_4': 1
+      'conv4_4': 1
+      'conv5_4': 1
+    vgg_type: vgg19
+    use_input_norm: true
+    perceptual_weight: !!float 1.0
+    style_weight: 0
+    range_norm: false
+    criterion: l1
+  # GAN损失
+  gan_opt:
+    type: GANLoss
+    gan_type: vanilla
+    real_label_val: 1.0
+    fake_label_val: 0.0
+    loss_weight: !!float 1e-1
+
+  # CLIP损失
+  clip_opt:
+    type: CLIPSemanticLoss
+    loss_weight: !!float 1e-1
+  
+  # 注意力损失
+  attention_opt:
+    type: TextRegionAttentionLoss
+    loss_weight: !!float 1e-1
+    
+  # 特征维度
+  feat_dim: 64
+
+  net_d_iters: 1
+  net_d_init_iters: 0
+  
+  # 混合精度
+  mixed_precision: true
+
+# 验证设置
+val:
+  val_freq: !!float 5e2
+  save_img: true
+  save_attention_maps: true
+  save_control_maps: true
+  compare_with_unguided: true
+  save_comparison: true
+  compare_metrics: true
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 4
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 4
+      test_y_channel: false
+
+# 日志设置
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 1e4
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+# 分布式训练设置
+dist_params:
+  backend: nccl
+  port: 29500 

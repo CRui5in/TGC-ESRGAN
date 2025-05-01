@@ -155,13 +155,13 @@ class TGCESRModel(SRGANModel):
                 logger.info(f'创建特征投影层: {feat_dim} -> {self.text_dim}')
         
         # 第5步：初始化额外损失函数
-        if self.is_train and 'clip_opt' in train_opt:
-            self.cri_clip = build_loss(train_opt['clip_opt']).to(self.device)
-            logger.info(f'初始化CLIP语义损失: {train_opt["clip_opt"]["type"]}')
+        # if self.is_train and 'clip_opt' in train_opt:
+        #     self.cri_clip = build_loss(train_opt['clip_opt']).to(self.device)
+        #     logger.info(f'初始化CLIP语义损失: {train_opt["clip_opt"]["type"]}')
         
-        if self.is_train and 'attention_opt' in train_opt:
-            self.cri_attention = build_loss(train_opt['attention_opt']).to(self.device)
-            logger.info(f'初始化注意力损失: {train_opt["attention_opt"]["type"]}')
+        # if self.is_train and 'attention_opt' in train_opt:
+        #     self.cri_attention = build_loss(train_opt['attention_opt']).to(self.device)
+        #     logger.info(f'初始化注意力损失: {train_opt["attention_opt"]["type"]}')
         
         # 第6步：设置优化器
         self.setup_optimizers()
@@ -891,7 +891,7 @@ class TGCESRModel(SRGANModel):
         
         # 添加计数器，限制只测试前50张图片
         test_count = 0
-        max_test_samples = 50
+        max_test_samples = 100
         
         # 在验证开始时重置指标字典，避免累加问题
         self.metric_results = {metric: 0 for metric in self.opt['val']['metrics'].keys()}
